@@ -49,6 +49,14 @@ export const SUBAGENT_TASK_TITLE = /^(你是|你作为|任务[:：]|你的任务
 //    而「决策文本含文件名」的口径实测 18/18 全为 0——两个口径都没有判别力。全表见
 //    docs/1015-深夜-最近在动-信号体检.md。
 export const RECENT_TOP = 3;
+
+/** [1016] 🌍 经验段：核心库已过两道闸与预算；这里**只做渲染**，空数组就整段不出现 */
+export function experiencesLine(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return '';
+  const body = rows.map((r) => String(r.text || '')).filter(Boolean).join('；');
+  return body ? '🌍 经验：' + body : '';
+}
+
 export function recentFilesLine(rows) {
   const list = Array.isArray(rows)
     ? rows.filter((x) => x && typeof x.file === 'string' && x.file.length >= 4).slice(0, RECENT_TOP)
@@ -216,6 +224,7 @@ function fetchBriefFeed(srelay, dbg) {
           unresolved: Number(j.counts?.unresolved ?? j.unresolved.length) || 0,
         },
         recentFiles: Array.isArray(j.recentFiles) ? j.recentFiles : [],
+        experiences: Array.isArray(j.experiences) ? j.experiences : [],
         calls: 1,
       };
     }
@@ -226,6 +235,7 @@ function fetchBriefFeed(srelay, dbg) {
     decRaw, unrRaw,
     counts: { decisions: jsonCount(decRaw, 'decisions'), unresolved: jsonCount(unrRaw, 'unresolved') },
     recentFiles: [],
+    experiences: [],
     calls: 2,
   };
 }
@@ -237,6 +247,8 @@ export function buildBrief(root, { srelay, dbg }) {
   if (kb) parts.push(kb);
   // 一次子进程取全（装的是老 CLI 时自动回落两次）——见 fetchBriefFeed 的注释
   const feed = fetchBriefFeed(srelay, dbg);
+  const exp = experiencesLine(feed.experiences);
+  if (exp) parts.push(exp);
   const rec = recentFilesLine(feed.recentFiles);
   if (rec) parts.push(rec);
   // 名额：决策 4 / 未决 3。原为 2/2，是看板未设上限时的配比——那时看板两行就吃掉
