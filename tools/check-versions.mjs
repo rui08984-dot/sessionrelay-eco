@@ -339,7 +339,7 @@ try {
   const SR = path.join(HOME2, '.agents/skills')
   const DR = path.join(HOME2, '.dsh/skills')
   const MIRRORED = ['handoff-atlas']
-  const RETIRED2 = ['handoff', 'project-atlas']
+  const RETIRED2 = ['handoff', 'project-atlas', 'state-stack']
   const md5f = (f) => createHash('md5').update(fs.readFileSync(f)).digest('hex')
   const listRel = (dir, base = dir, out = []) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

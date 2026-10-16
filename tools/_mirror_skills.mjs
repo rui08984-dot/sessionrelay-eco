@@ -29,7 +29,7 @@ const DST_ROOTS = [
 /** 需要镜像的技能（新增技能时加一行） */
 const SKILLS = ['handoff-atlas'];
 /** 已退役/已合并的技能——各技能目录里都必须不存在，否则会被当独立技能加载 */
-const RETIRED = ['handoff', 'project-atlas'];
+const RETIRED = ['handoff', 'project-atlas', 'state-stack'];
 
 const CHECK = process.argv.includes('--check');
 const md5 = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');

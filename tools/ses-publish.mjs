@@ -86,7 +86,14 @@ for (const r of REQUIRED) if (!fs.existsSync(path.join(ROOT, r))) bad('源缺失
 if (fail) { say('\n🔴 前置检查未过'); process.exit(1); }
 
 // ── 1) 清空目标 ───────────────────────────────────────────────────────────
-if (fs.existsSync(OUT)) fs.rmSync(OUT, { recursive: true, force: true });
+// 清空目标，但**保留 .git**（否则每次重组装都会丢掉提交历史与远端配置，
+// 下次推送只能 force——实测踩过：一次 --force 之后仓库变成孤儿）
+if (fs.existsSync(OUT)) {
+  for (const e of fs.readdirSync(OUT)) {
+    if (e === '.git') continue;
+    fs.rmSync(path.join(OUT, e), { recursive: true, force: true });
+  }
+}
 fs.mkdirSync(OUT, { recursive: true });
 
 // ── 2) 四个包 + 技能 + 工具 ───────────────────────────────────────────────
