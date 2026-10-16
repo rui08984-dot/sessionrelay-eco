@@ -1,0 +1,275 @@
+// ZCode Adapter（统一接口版，改进方案 改动1 + 改动2 compaction 摘要）
+// 存储：~/.zcode/cli/db/db.sqlite（WAL 活动库，只读连接）
+import fs from 'node:fs';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import type { SessionSourceAdapter, AdapterConfig, DiscoveredSession, ReadResult, CompactionInfo } from '../types.js';
+
+export const SOURCE_ID = 'zcode';
+
+// 连接缓存：守护每 30 秒调用 discover/readNew，避免每次开/关导致句柄泄漏
+let cachedConn: InstanceType<typeof Database> | null = null;
+let cachedPath: string | null = null;
+
+function getConn(dbPath: string): InstanceType<typeof Database> {
+  if (cachedConn && cachedPath === dbPath && fs.existsSync(dbPath)) return cachedConn;
+  if (cachedConn) { try { cachedConn.close(); } catch { /* 已关 */ } }
+  cachedConn = new Database(dbPath, { readonly: true });
+  cachedConn.pragma('busy_timeout = 3000');
+  cachedPath = dbPath;
+  return cachedConn;
+}
+
+/** 仅供测试：重置连接缓存 */
+export function resetConn(): void {
+  if (cachedConn) { try { cachedConn.close(); } catch { /* 忽略 */ } }
+  cachedConn = null;
+  cachedPath = null;
+}
+
+// [fork 0922] discover 结果缓存：源库未被写入（文件 mtime 未变）时直接复用上一轮结果，
+// 空闲周期 0 SQL。原实现每周期对 ZCode 库全表 lower(directory) 扫描（无索引），
+// 全局守护 N 个 worker × 每个事件都各扫一遍。
+// ⚠️ 键必须含项目根：多个项目共享同一源库，只按 mtime 键会让 B 项目拿到 A 项目的
+// 会话列表并错误入库（0922 晚实测污染：music 42→559、novel 15→495）。
+const discoverCache = new Map<string, { mtimeMs: number; rows: DiscoveredSession[] }>();
+
+/**
+ * [1015 夜 · 出口③第一刀] ZCode **自己就标了会话目的**（`session.task_type`）——不要再拿标题猜。
+ *
+ * 病历：原实现用 `/^workflow subagent/i` 匹配标题来判定「这是施工日志不是项目会话」。
+ * 实测对拍（tools/_probe_zcode_purpose_leak.mjs，2026-10-15）：
+ *   · 主库 zcode 源 568 场里，真值 subagent_child 的 **382 场全部漏过标题正则**，贡献 **254 条决策**（占全库 27%）；
+ *   · 对照库漏 69 场 / 54 条决策；
+ *   · 反向（标题像子代理但真值不是）：**0 场**。
+ * 即：真值就在库里，我们却在猜，而且漏掉了绝大多数。
+ * task_type 取值（本机实测分布）：subagent_child 754 / workflow_child 595 / interactive 209 /
+ * selection_side_chat 12 / fork 1。只把「子代理/工作流子会话」判为 workflow ——
+ * selection_side_chat（划词侧问）是用户自己驱动的，interactive 是正常会话，都不动。
+ */
+export function isSubagentKind(t: string | null | undefined): boolean {
+  return t === 'subagent_child' || t === 'workflow_child'
+}
+
+export function discover(projectRoot: string, dbPath: string): DiscoveredSession[] {
+  if (!fs.existsSync(dbPath)) return [];
+  const st = fs.statSync(dbPath);
+  const cacheKey = `${path.resolve(projectRoot).toLowerCase()}\u0000${path.resolve(dbPath).toLowerCase()}`;
+  const hit = discoverCache.get(cacheKey);
+  if (hit && hit.mtimeMs === st.mtimeMs) return hit.rows;
+  const z = getConn(dbPath);
+  try {
+    // ⚠️ task_type 是较新版本才有的列：老库上直接 SELECT 会抛，整条采集链会静默变空
+    // （实测：test/integration/capture.spec.ts 与 forget/resurrection.spec.ts 的假库都没有这列，
+    //   9 条测试当场红）。所以缺列时**退回旧查询**，判据自动降级为标题正则——老库照常工作。
+    type Row = { id: string; title: string; task_type: string | null; time_created: number; time_updated: number };
+    let rows: Row[];
+    try {
+      rows = z
+        .prepare('SELECT id, title, task_type, time_created, time_updated FROM session WHERE lower(directory) = lower(?)')
+        .all(path.resolve(projectRoot)) as Row[];
+    } catch {
+      rows = (z
+        .prepare('SELECT id, title, time_created, time_updated FROM session WHERE lower(directory) = lower(?)')
+        .all(path.resolve(projectRoot)) as Array<Omit<Row, 'task_type'>>).map((r) => ({ ...r, task_type: null }));
+    }
+    const out = rows.map((r) => ({
+      source: SOURCE_ID,
+      sourceSessionId: r.id,
+      sourceFile: `zcode:${r.id}`,
+      title: r.title,
+      createdAt: new Date(r.time_created).toISOString(),
+      updatedAt: new Date(r.time_updated).toISOString(),
+      sizeBytes: 0,
+      mtimeMs: r.time_updated,
+      // [fork 0924] 工作流子代理会话标注 origin=workflow：它们是施工日志不是项目会话，
+      // 决策提取/检索默认排除（mc整合包实测：88% 决策碎片来自它们）。
+      // [1015 夜] 判据换成**库里的真值** task_type；标题正则只作老库/缺字段时的兜底。
+      originHint: (isSubagentKind(r.task_type) || /^workflow subagent/i.test(r.title ?? '')) ? ('workflow' as const) : undefined,
+    }));
+    discoverCache.set(cacheKey, { mtimeMs: st.mtimeMs, rows: out });
+    return out;
+  } finally {
+    // 使用缓存连接，不关闭（由 resetConn 或进程退出时关闭）
+  }
+}
+
+export function readNew(ds: DiscoveredSession, dbPath: string, cursor: unknown): ReadResult {
+  const cur = (cursor ?? {}) as { rowid?: number };
+  if (!fs.existsSync(dbPath)) return { messages: [], badLines: 0, cursor: cur };
+  const z = getConn(dbPath);
+  try {
+    z.pragma('busy_timeout = 3000');
+    const rows = z
+      .prepare('SELECT id AS mid, rowid AS mrowid, sequence, time_created, data FROM message WHERE session_id = ? AND rowid > ? ORDER BY rowid')
+      .all(ds.sourceSessionId, cur.rowid ?? 0) as Array<{ mid: string; mrowid: number; sequence: number | null; time_created: number; data: string }>;
+    const selectParts = z.prepare(
+      `SELECT data FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'text' ORDER BY sequence, rowid`
+    );
+    // 改动 2：compaction 摘要 part 查询
+    const selectCompParts = z.prepare(
+      `SELECT p.data, p.time_created FROM part p
+       WHERE p.session_id = ?
+         AND json_extract(p.data, '$.type') = 'compaction'
+         AND p.time_created > ?
+       ORDER BY p.time_created`
+    );
+
+    const messages: ReadResult['messages'] = [];
+    let maxSeq = 0;
+    // 游标竞态防线（用户实测 assistant 消息整批丢失的根因）：
+    // ZCode 先写 message 行、text part 流式后到。读到"无正文"的行时若游标照样
+    // 越过，正文落库后永远不会再被扫描（rowid > cursor）。对策：宽限期内
+    // （10 分钟）游标停在第一个空正文行之前，等下一轮重扫；过宽限的空行
+    // （已删除/中断的消息）不再拖住游标。重扫靠 messages (session_id, seq_num)
+    // 唯一键幂等，不会重复插入。
+    const EMPTY_GRACE_MS = 10 * 60_000;
+    let firstRecentEmpty: number | null = null; // 宽限期内空正文行的最小 rowid
+    let examined = cur.rowid ?? 0;
+    for (const r of rows) {
+      examined = r.mrowid;
+      let role: string;
+      try {
+        role = JSON.parse(r.data).role;
+      } catch {
+        continue;
+      }
+      const parts = selectParts.all(r.mid) as Array<{ data: string }>;
+      const content = parts
+        .map((p) => { try { return (JSON.parse(p.data).text ?? '') as string; } catch { return ''; } })
+        .join('\n')
+        .trim();
+      if (!content) {
+        if (r.time_created >= Date.now() - EMPTY_GRACE_MS && firstRecentEmpty === null) {
+          firstRecentEmpty = r.mrowid;
+        }
+        continue;
+      }
+      const seq = r.sequence ?? r.mrowid;
+      messages.push({
+        role: role === 'user' ? 'user' : 'assistant',
+        content,
+        seqNum: seq,
+        createdAt: new Date(r.time_created).toISOString(),
+      });
+      maxSeq = Math.max(maxSeq, seq);
+    }
+
+    // 改动 2：捕获 compaction 摘要（AI 生成的压缩摘要存为 system 角色消息）
+    const cursorObj = cur as { rowid?: number; lastCompaction?: number };
+    const compParts = selectCompParts.all(ds.sourceSessionId, cursorObj.lastCompaction ?? 0) as Array<{ data: string; time_created: number }>;
+    for (const cp of compParts) {
+      try {
+        const data = JSON.parse(cp.data);
+        // 从 summaryMessageId 找摘要的 text part
+        let summaryText = '';
+        if (data.summaryMessageId) {
+          const summaryParts = z.prepare(
+            `SELECT data FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'text' ORDER BY sequence, rowid`
+          ).all(data.summaryMessageId) as Array<{ data: string }>;
+          summaryText = summaryParts
+            .map((p) => { try { return (JSON.parse(p.data).text ?? '') as string; } catch { return ''; } })
+            .join('\n')
+            .trim();
+        }
+        if (summaryText) {
+          maxSeq += 1;
+          messages.push({
+            role: 'system',
+            content: `[上下文压缩摘要] ${summaryText.slice(0, 2000)}`,
+            seqNum: maxSeq,
+            createdAt: new Date(cp.time_created).toISOString(),
+          });
+        }
+      } catch { /* 坏 compaction part 跳过 */ }
+    }
+
+    // 游标结算：宽限期内有空正文行 → 停在它之前（下一轮从这行重扫）；
+    // 否则推进到本次扫描末尾（现行为）。取 max 防回退。
+    const safeRowid = firstRecentEmpty !== null ? firstRecentEmpty - 1 : examined;
+    const maxRowid = Math.max(cur.rowid ?? 0, rows.length > 0 ? safeRowid : cur.rowid ?? 0);
+    const lastComp = compParts.length > 0 ? compParts[compParts.length - 1].time_created : (cursorObj.lastCompaction ?? 0);
+    return { messages, badLines: 0, cursor: { rowid: maxRowid, lastCompaction: lastComp } };
+  } finally {
+    // 缓存连接，不关闭
+  }
+}
+
+// ── 改动 3：compaction 检测 ──
+export function detectCompaction(ds: DiscoveredSession, dbPath: string): CompactionInfo | null {
+  if (!fs.existsSync(dbPath)) return null;
+  // [fork] 复用 getConn 缓存连接——原实现每个会话每周期 new Database 却从不关闭
+  // （注释"缓存连接"系自 getConn 误复制），连接全靠 GC 兜底 → 句柄泄漏 + 内存锯齿 + CPU 空烧（上游 #2 根因）
+  const z = getConn(dbPath);
+  try {
+    z.pragma('busy_timeout = 3000');
+    const comp = z.prepare(`
+      SELECT data, time_created FROM part
+      WHERE session_id = ?
+        AND json_extract(data, '$.type') = 'compaction'
+      ORDER BY time_created DESC LIMIT 1
+    `).get(ds.sourceSessionId) as { data: string; time_created: number } | undefined;
+    if (!comp) return null;
+    const data = JSON.parse(comp.data);
+    // 估算被删消息数：压缩前后 token 差 / 平均每条消息约 500 token
+    const estimated = Math.max(0, Math.floor(
+      ((data.preCompactTokenCount ?? 0) - (data.truePostCompactTokenCount ?? 0)) / 500
+    ));
+    return {
+      compactedAt: new Date(comp.time_created).toISOString(),
+      estimatedDeleted: estimated,
+      summaryMessageId: data.summaryMessageId,
+    };
+  } finally {
+    // 复用缓存连接，不关闭（与注释语义一致）
+  }
+}
+
+// ── 统一接口导出（注册表用） ──
+export const adapter: SessionSourceAdapter = {
+  id: SOURCE_ID,
+  displayName: 'ZCode',
+  discover(root, config) {
+    return discover(root, config.dbPath as string);
+  },
+  async readNew(ds, cursor, config) {
+    return Promise.resolve(readNew(ds, config.dbPath as string, cursor));
+  },
+  watchRoots(_root, config) {
+    const dbPath = config.dbPath as string;
+    return fs.existsSync(dbPath) ? [path.dirname(dbPath)] : [];
+  },
+  healthCheck(_root, config) {
+    const dbPath = config.dbPath as string;
+    if (!fs.existsSync(dbPath)) return `数据库不存在：${dbPath}（未安装 ZCode 可忽略）`;
+    try {
+      const z = new Database(dbPath, { readonly: true });
+      z.close(); // [fork] 探测完即关：一次性连接不留着等 GC（原实现泄漏句柄，doctor 路径）
+      return null;
+    } catch (e) {
+      return `只读探测失败：${(e as Error).message}`;
+    }
+  },
+  detectCompaction(ds, config) {
+    return detectCompaction(ds, config.dbPath as string);
+  },
+
+  // [fork 0922] 内容签名：两条聚合查询拿全表 MAX(rowid)（消息+part，part 覆盖 compaction 追加）。
+  // 内容变更必动 rowid；mtime 不可靠（测试夹具证明追加可以不 bump time_updated）。
+  changeProbe(config) {
+    const dbPath = config.dbPath as string;
+    const out = new Map<string, string>();
+    if (!fs.existsSync(dbPath)) return out;
+    const z = getConn(dbPath);
+    try {
+      z.pragma('busy_timeout = 3000');
+      const msg = z.prepare('SELECT session_id, MAX(rowid) AS m FROM message GROUP BY session_id').all() as Array<{ session_id: string; m: number }>;
+      const part = z.prepare('SELECT session_id, MAX(rowid) AS m FROM part GROUP BY session_id').all() as Array<{ session_id: string; m: number }>;
+      for (const r of msg) out.set(r.session_id, String(r.m));
+      for (const r of part) out.set(r.session_id, `${out.get(r.session_id) ?? '0'}/${r.m}`);
+      return out;
+    } catch {
+      return out; // 探针失败 → 空签名 → 全部不命中水位线 → 全量 ingest（安全侧）
+    }
+  },
+};

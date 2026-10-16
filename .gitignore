@@ -1,0 +1,25 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# 自包含运行时（体积大，走 Release 离线包，不进 git）
+vendor/
+.vendor-tmp/
+*.tgz
+
+# 记忆库与运行时数据（属于使用者，不属于仓库）
+.sessionrelay/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# 离线包与备份
+*.zip
+backups/
+*.log
+.bak-*
+.DS_Store
+Thumbs.db
