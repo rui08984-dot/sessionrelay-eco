@@ -108,6 +108,8 @@ if (!NOGUARD) {
   const guards = [
     ["check-versions", [path.join(HERE, "tools", "check-versions.mjs")]],
     ["check-brief-filters", [path.join(HERE, "tools", "check-brief-filters.mjs")]],
+    // [B6] 不变量守门：同一条规则只准有一份实现（静态）+ 两条行为断言的存在性
+    ["check-invariants", [path.join(HERE, "tools", "check-invariants.mjs")]],
     ["插件 selftest", [path.join(HERE, "plugins", "dsh", "selftest.mjs")]],
   ];
   for (const [name, argv] of guards) {

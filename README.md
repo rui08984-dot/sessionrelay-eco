@@ -12,8 +12,8 @@
 
 | 你在用什么 | 下载 | 干什么用的 | 大小 |
 |---|---|---|---|
-| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.1.zip** | 每轮自动把项目简报注入 system prompt | ~20MB（自带运行时） |
-| **ZCode** | **zcode-adapter-1.0.1.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~21KB |
+| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.2.zip** | 每轮自动把项目简报注入 system prompt | ~20MB（自带运行时） |
+| **ZCode** | **zcode-adapter-1.0.2.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~21KB |
 | 两个都用 / 新机器一次装齐 | **ses-offline-\<日期\>.zip** | 全家桶：内核产物 + 插件 + 适配器 + 技能 + 工具 | ~20MB |
 
 三个包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
@@ -23,7 +23,7 @@
 
 **DSH 用户**
 
-1. 下载 `dsh-plugin-0.2.1.zip`，解压
+1. 下载 `dsh-plugin-0.2.2.zip`，解压
 2. 把 `dsh-plugin/` 整个目录复制到 `<你的 DSH 配置目录>/profiles/<profile>/local-plugins/dsh-srelay-brief/`
 3. **重启 DSH** → 新开会话，开场应出现 📋 看板 / 决策行
 
@@ -32,7 +32,7 @@
 
 **ZCode 用户**
 
-1. 下载 `zcode-adapter-1.0.1.zip`，解压
+1. 下载 `zcode-adapter-1.0.2.zip`，解压
 2. 在解压出来的 `zcode-adapter/` 里跑两条命令：
 
 ```bash

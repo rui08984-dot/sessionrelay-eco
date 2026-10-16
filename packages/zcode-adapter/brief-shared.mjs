@@ -5,6 +5,7 @@
 
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 // [fork 1015] 简报过滤器的单一权威源——与 DSH 插件 plugins/dsh/src/brief-filters.mjs 同字节。
 // 历史上两侧手抄导致过滤器漂移（DSH 多一条而这里没有，而用户日常在 ZCode 侧干活）。
 // 改过滤器只能改那一份，然后同步到这里；tools/check-brief-filters.mjs 会抓不同步。
@@ -55,6 +56,34 @@ export function experiencesLine(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return '';
   const body = rows.map((r) => String(r.text || '')).filter(Boolean).join('；');
   return body ? '🌍 经验：' + body : '';
+}
+
+/**
+ * 🌿 Git 脏状态一行（[B5]，2026-10-16）—— 与 DSH 插件 `plugins/dsh/index.js` 的 gitStatusText 同规。
+ *
+ * 为什么值得占预算：模型看不到工作区状态时会把"已经改了一半的东西"当成不存在，
+ * 典型症状是它让你"先写 X"，而 X 其实早就写完、只差提交。
+ * 为什么这里可以同步起子进程：本函数只跑在 **SessionStart**（一次性），不在每轮注入的路径上；
+ * 每轮的那个 hook（brief-turn.mjs）**绝不**起子进程，这条线不许越。
+ * 失败一律静默（不是 git 仓库 / 没装 git / 超时 → 空串，整行不出现）。
+ */
+export function gitStatusLine(root) {
+  try {
+    // -c core.quotepath=false：否则中文文件名会被转义成 \345\233\276 这种八进制
+    const out = execFileSync('git', ['-c', 'core.quotepath=false', '-C', root, 'status', '--porcelain=v1', '--branch'],
+      { timeout: 1500, windowsHide: true, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    const lines = String(out || '').split(/\r?\n/).filter(Boolean);
+    if (lines.length === 0) return null;
+    const head = lines[0].startsWith('##') ? lines[0].slice(2).trim() : '';
+    const br = /^([^\s.]+)/.exec(head)?.[1] ?? '';
+    const gap = /\[([^\]]+)\]/.exec(head)?.[1] ?? '';
+    const files = lines.slice(1);
+    if (!br && files.length === 0) return null;
+    const names = files.slice(0, 3).map((l) => l.slice(3).trim().replace(/^"|"$/g, '')).map((n) => (n.length > 28 ? '…' + n.slice(-26) : n));
+    const more = files.length > names.length ? ` 等 ${files.length} 个` : '';
+    const body = files.length === 0 ? '工作区干净' : `${files.length} 个未提交：${names.join('、')}${more}`;
+    return `🌿 Git：${br}${gap ? ' ' + gap : ''} · ${body}`;
+  } catch { return null }
 }
 
 export function recentFilesLine(rows) {
@@ -245,6 +274,9 @@ export function buildBrief(root, { srelay, dbg }) {
   const parts = [`📍 项目状态简报（自动注入，出处可信；注入≠强制续作——你下一句话才是指令；说"继续"按此续作）`];
   const kb = kanbanLines(root, dbg);
   if (kb) parts.push(kb);
+  // [B5] Git 脏状态：只在开场简报里给（一次性子进程），每轮 hook 不碰
+  const git = gitStatusLine(root);
+  if (git) parts.push(git);
   // 一次子进程取全（装的是老 CLI 时自动回落两次）——见 fetchBriefFeed 的注释
   const feed = fetchBriefFeed(srelay, dbg);
   const exp = experiencesLine(feed.experiences);

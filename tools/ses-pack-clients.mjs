@@ -23,7 +23,7 @@ const PLUGIN = path.join(ROOT, 'plugins', 'dsh');
 const ZC = path.join(ROOT, 'integrations', 'zcode');
 const OUTDIR = path.join(ROOT, 'artifacts');
 // ZCode 适配器没有 package.json，版本号在这里**只准有一处**（此前散在三行里，改名容易漏）
-const ZCODE_ADAPTER_VERSION = '1.0.1';
+const ZCODE_ADAPTER_VERSION = '1.0.2';
 const ZCODE_ZIP = 'zcode-adapter-' + ZCODE_ADAPTER_VERSION + '.zip';
 const BT = String.fromCharCode(96);
 const FENCE = BT + BT + BT;

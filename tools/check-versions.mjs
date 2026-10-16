@@ -23,7 +23,14 @@ import { execSync, spawnSync } from 'node:child_process'
 // G 段要直接读各项目库的概况：用内置 node:sqlite（Node ≥22.5）。取不到就把 G 段的统计降级。
 let _DatabaseSync = null
 try { ({ DatabaseSync: _DatabaseSync } = await import('node:sqlite')) } catch { /* 老 Node：G 段仍会打印看板与体积 */ }
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
+
+// [B3] 一次性探针会话的判据：从核心库构建产物取（**不另写一套** —— 判据只有一处）
+let PROBE_SQL = '(1=0)'
+try {
+  const coreEntry = await import(pathToFileURL(path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), 'core/SessionRelay/dist/recall.js')).href)
+  if (typeof coreEntry.PROBE_SQL === 'string') PROBE_SQL = coreEntry.PROBE_SQL
+} catch { /* 核心库没构建：退化为"不排除任何会话"，本节只是通报 */ }
 
 const ROOT = 'D:/dsh插件  记忆'
 const HOME = process.env.USERPROFILE || process.env.HOME
@@ -249,12 +256,14 @@ try {
       } catch { kanban = '看板读取失败' }
     }
     const dbp = path.join(root, '.sessionrelay', 'relay.sqlite')
-    let sess = 0, dec = 0, mb = 0, ver = 0, winN = 0, winSess = 0, winMax = 0, revivedN = 0, revivedDec = 0
+    let sess = 0, dec = 0, mb = 0, ver = 0, winN = 0, winSess = 0, winMax = 0, revivedN = 0, revivedDec = 0, probeN = 0
     if (fs.existsSync(dbp) && _DatabaseSync) {
       mb = Math.round(fs.statSync(dbp).size / 1024 / 1024)
       try {
         const d = new _DatabaseSync(dbp, { readOnly: true, timeout: 5000 })
         sess = d.prepare('SELECT COUNT(*) AS n FROM sessions').get().n ?? 0
+        // [B3] 一次性探针会话数：判据来自核心库（recall.js 的 PROBE_SQL），这里不另写一套
+        try { probeN = d.prepare('SELECT COUNT(*) AS n FROM sessions s WHERE ' + PROBE_SQL).get().n ?? 0 } catch { probeN = 0 }
         for (const r of d.prepare("SELECT decisions FROM sessions WHERE decisions IS NOT NULL AND decisions != '[]'").all()) {
           try { dec += JSON.parse(r.decisions).length } catch { /* 坏 JSON 跳过 */ }
         }
@@ -298,7 +307,8 @@ try {
     // 注意这是**原始窗**的集中度，不是过完过滤链之后的——后者要点亮整条链，代价不值。
     if (winN >= 6 && winSess <= 3) flags.push(`窗内素材薄：${winN} 条只来自 ${winSess} 场`) 
     if (revivedN) flags.push(`复活过 ${revivedN} 场（骨架 ${revivedDec} 条）`)
-    say(`  ${flags.length ? '⚠️ ' : '✅'} ${root.padEnd(34)} ${kanban.padEnd(16)} ${String(sess).padStart(4)} 会话 ${String(dec).padStart(5)} 决策 ${String(mb).padStart(3)}MB v${ver} 窗内${String(winN).padStart(3)}条/${String(winSess).padStart(2)}场${flags.length ? '  ← ' + flags.join(' / ') : ''}`)
+    const probeTag = probeN > 0 ? ` （探针 ${probeN}）` : ''
+    say(`  ${flags.length ? '⚠️ ' : '✅'} ${root.padEnd(34)} ${kanban.padEnd(16)} ${String(sess).padStart(4)} 会话${probeTag} ${String(dec).padStart(5)} 决策 ${String(mb).padStart(3)}MB v${ver} 窗内${String(winN).padStart(3)}条/${String(winSess).padStart(2)}场${flags.length ? '  ← ' + flags.join(' / ') : ''}`)
   }
 } catch { say('  （读不到注册表）') }
 
