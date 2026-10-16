@@ -67,20 +67,16 @@ function readStdin() {
   try { return JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { return {}; }
 }
 
-/** 项目根：优先用核心库的判据（含"主目录/临时目录不参与向上认领"），拿不到才用本地同规实现 */
+/**
+ * 项目根：判据**只在核心库里**（含"主目录/临时目录不参与向上认领"与"要有真项目标记"——
+ * 全局经验库也住在 ~/.sessionrelay 名下，只看目录会把主目录误判成项目）。
+ *
+ * ⚠️ 这里曾经还有一份"同规"的本地实现，它是**死代码**：引擎缺席时下面整段都不注入，
+ * 本地判出来的 root 永远没人用。删掉它 = 少一份会漂移的副本（code review 抓到）。
+ */
 function findRoot(start) {
-  if (!start) return null;
-  if (recallMod && typeof recallMod.findRelayRoot === 'function') {
-    try { return recallMod.findRelayRoot(start); } catch { /* 回落本地 */ }
-  }
-  let dir = start;
-  for (let i = 0; i < 30; i++) {
-    if (existsSync(join(dir, '.sessionrelay', 'relay.sqlite'))) return dir;
-    const up = dirname(dir);
-    if (up === dir) return null;
-    dir = up;
-  }
-  return null;
+  if (!start || !recallMod || typeof recallMod.findRelayRoot !== 'function') return null;
+  try { return recallMod.findRelayRoot(start); } catch { return null; }
 }
 
 /**
