@@ -24,6 +24,8 @@ const N = Number(arg('n', '150'));
 const LIMIT = Number(arg('limit', '10'));
 const REWRITE = arg('rewrite', '1') !== '0';
 const FUSION = arg('fusion', '0') === '1';
+// 默认 = 产品默认（长度归一默认开）；--lengthnorm 0 才关掉，用于 A/B
+const LENGTHNORM = arg('lengthnorm', '1') !== '0';
 
 const db = new Database(dbPath, { readonly: true });
 const projRow = db.prepare('SELECT project_id FROM sessions LIMIT 1').get() as { project_id: string };
@@ -42,7 +44,14 @@ function df(tok: string): number {
   return r.c;
 }
 
-const sessions = db.prepare('SELECT id, message_count AS c FROM sessions WHERE message_count BETWEEN 4 AND 600 ORDER BY RANDOM() LIMIT ?').all(N * 4) as Array<{ id: string; c: number }>;
+// [1016 · 红队B 纠正] 原先写的是 BETWEEN 4 AND 600 —— 于是**巨无霸永远不是答案**，
+// 而"把巨无霸压下去"的改动（长度归一化）在这个口径下必然虚高（实测它只在"答案是小会话"时成立）。
+// 现在按**全量分层**抽样：小会话、中等、巨无霸都进池子，让基准同时覆盖两种情形。
+const sessions = db.prepare(`
+  SELECT id, message_count AS c FROM sessions
+   WHERE message_count >= 4
+   ORDER BY RANDOM() LIMIT ?
+`).all(N * 4) as Array<{ id: string; c: number }>;
 const pickMsg = db.prepare("SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND length(content) BETWEEN 30 AND 400 LIMIT 3");
 
 const stats = { sess: sessions.length, toks: 0, noRare: 0, fewCommon: 0, ok: 0 };
@@ -68,7 +77,7 @@ for (const s of sessions) {
 const acc: Record<string, { n: number; h1: number; h3: number; h10: number }> = { K: { n: 0, h1: 0, h3: 0, h10: 0 }, S: { n: 0, h1: 0, h3: 0, h10: 0 }, M: { n: 0, h1: 0, h3: 0, h10: 0 } };
 for (const it of items) {
   let ids: string[] = [];
-  try { ids = searchSessions(db, { project: PID, query: it.query, limit: LIMIT, rewrite: REWRITE, fusion: FUSION } as never).map((h) => h.sessionId); } catch { continue; }
+  try { ids = searchSessions(db, { project: PID, query: it.query, limit: LIMIT, rewrite: REWRITE, fusion: FUSION, lengthNorm: LENGTHNORM } as never).map((h) => h.sessionId); } catch { continue; }
   const i = ids.indexOf(it.target);
   const a = acc[it.arm];
   a.n++;
@@ -77,7 +86,7 @@ for (const it of items) {
   if (i >= 0) a.h10++;
 }
 
-console.log('库: ' + dbPath + '  改写: ' + (REWRITE ? 'on' : 'off') + '  融合: ' + (FUSION ? 'on' : 'off') + '  limit=' + LIMIT);
+console.log('库: ' + dbPath + '  改写: ' + (REWRITE ? 'on' : 'off') + '  融合: ' + (FUSION ? 'on' : 'off') + '  长度归一: ' + (LENGTHNORM ? 'on' : 'off'));
 console.log('臂   样本    hit@1        hit@3        hit@10');
 for (const k of ['K', 'S', 'M']) {
   const a = acc[k];

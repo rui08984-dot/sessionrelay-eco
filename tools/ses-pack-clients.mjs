@@ -22,6 +22,9 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PLUGIN = path.join(ROOT, 'plugins', 'dsh');
 const ZC = path.join(ROOT, 'integrations', 'zcode');
 const OUTDIR = path.join(ROOT, 'artifacts');
+// ZCode 适配器没有 package.json，版本号在这里**只准有一处**（此前散在三行里，改名容易漏）
+const ZCODE_ADAPTER_VERSION = '1.0.1';
+const ZCODE_ZIP = 'zcode-adapter-' + ZCODE_ADAPTER_VERSION + '.zip';
 const BT = String.fromCharCode(96);
 const FENCE = BT + BT + BT;
 
@@ -131,10 +134,10 @@ else {
   ].join(String.fromCharCode(10));
   entries['zcode-adapter/README-INSTALL.md'] = new Uint8Array(Buffer.from(howto, 'utf8'));
   const buf = fflate.zipSync(entries, { level: 9 });
-  const out = path.join(OUTDIR, 'zcode-adapter-1.0.0.zip');
+  const out = path.join(OUTDIR, ZCODE_ZIP);
   fs.writeFileSync(out, buf);
-  results.push(['zcode-adapter-1.0.0.zip', buf.length, Object.keys(entries).length]);
-  say('  ✅ zcode-adapter-1.0.0.zip  ' + (buf.length / 1024).toFixed(0) + 'KB / ' + Object.keys(entries).length + ' 文件');
+  results.push([ZCODE_ZIP, buf.length, Object.keys(entries).length]);
+  say('  ✅ ' + ZCODE_ZIP + '  ' + (buf.length / 1024).toFixed(0) + 'KB / ' + Object.keys(entries).length + ' 文件');
 }
 
 // ── 3) 台账 ──

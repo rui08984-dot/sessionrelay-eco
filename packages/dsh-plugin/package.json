@@ -1,6 +1,6 @@
 {
   "name": "dsh-srelay-brief",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -51,6 +51,10 @@
     "src/state.js",
     "src/define-tool.js",
     "src/index.js",
-    "vendor/**"
+    "vendor/**",
+    "src/brief-experiences.mjs",
+    "src/brief-filters.mjs",
+    "src/brief-modules.mjs",
+    "src/root-rules.mjs"
   ]
 }

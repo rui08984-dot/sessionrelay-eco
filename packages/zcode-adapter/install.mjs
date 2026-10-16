@@ -35,7 +35,7 @@ const ZCODE = path.resolve(arg('zcode-home', path.join(os.homedir(), '.zcode')))
 const NODE = arg('node', process.execPath);
 const TARGET = path.join(ZCODE, 'hooks', 'statebrief');
 const CONFIG = path.join(ZCODE, 'cli', 'config.json');
-const FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs'];
+const FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs'];
 
 let bad = 0;
 const say = (s) => console.log(s);
@@ -71,14 +71,28 @@ cfg.hooks.enabled = true;
 cfg.hooks.events = cfg.hooks.events || {};
 const list = (cfg.hooks.events.SessionStart = cfg.hooks.events.SessionStart || [{ hooks: [] }]);
 if (!Array.isArray(list[0].hooks)) list[0].hooks = [];
-const entry = {
-  type: 'process', command: NODE,
-  args: [path.join(TARGET, 'brief.mjs').replace(/\\/g, '/')],
-  timeoutMs: 20000, statusMessage: '拉取项目状态简报',
+// 两个事件各注册一条：
+//   SessionStart     → 开场简报（一次性：项目在做什么）
+//   UserPromptSubmit → **每轮按你这句话做相关召回**（增量按需；实测冷启动 200ms 量级）
+// 预算口径不同：开场宽，每轮窄（经验 ≤200 字符 + 旧决策 ≤2 条）。
+const addHook = (eventName, file, statusMessage, timeoutMs) => {
+  cfg.hooks.events[eventName] = cfg.hooks.events[eventName] || [{ hooks: [] }];
+  const lst = cfg.hooks.events[eventName];
+  if (!Array.isArray(lst[0].hooks)) lst[0].hooks = [];
+  const e = {
+    type: 'process', command: NODE,
+    args: [path.join(TARGET, file).replace(/\\/g, '/')],
+    timeoutMs, statusMessage,
+  };
+  const i = lst[0].hooks.findIndex((h) => Array.isArray(h.args) && h.args.some((x) => String(x).includes(file.replace('.mjs', ''))));
+  if (i >= 0) { lst[0].hooks[i] = e; return true; }
+  lst[0].hooks.push(e);
+  return false;
 };
-const hit = list[0].hooks.findIndex((h) => Array.isArray(h.args) && h.args.some((a) => String(a).includes('statebrief')));
-if (hit >= 0) { existed = true; list[0].hooks[hit] = entry; } else list[0].hooks.push(entry);
-doIt((existed ? '更新已有注册' : '新增注册') + '：' + entry.command + ' ' + entry.args[0]);
+const upd1 = addHook('SessionStart', 'brief.mjs', '拉取项目状态简报', 20000);
+const upd2 = addHook('UserPromptSubmit', 'brief-turn.mjs', '召回相关记忆', 8000);
+doIt((upd1 ? '更新' : '新增') + ' SessionStart → brief.mjs');
+doIt((upd2 ? '更新' : '新增') + ' UserPromptSubmit → brief-turn.mjs（每轮相关召回）');
 if (APPLY) {
   if (fs.existsSync(CONFIG)) {
     const bak = CONFIG + '.bak-' + new Date().toISOString().replace(/[:.]/g, '-');

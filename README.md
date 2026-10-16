@@ -12,8 +12,8 @@
 
 | 你在用什么 | 下载 | 干什么用的 | 大小 |
 |---|---|---|---|
-| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.0.zip** | 每轮自动把项目简报注入 system prompt | ~20MB（自带运行时） |
-| **ZCode** | **zcode-adapter-1.0.0.zip** | 开场自动注入项目简报（SessionStart hook） | ~21KB |
+| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.1.zip** | 每轮自动把项目简报注入 system prompt | ~20MB（自带运行时） |
+| **ZCode** | **zcode-adapter-1.0.1.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~21KB |
 | 两个都用 / 新机器一次装齐 | **ses-offline-\<日期\>.zip** | 全家桶：内核产物 + 插件 + 适配器 + 技能 + 工具 | ~20MB |
 
 三个包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
@@ -23,7 +23,7 @@
 
 **DSH 用户**
 
-1. 下载 `dsh-plugin-0.2.0.zip`，解压
+1. 下载 `dsh-plugin-0.2.1.zip`，解压
 2. 把 `dsh-plugin/` 整个目录复制到 `<你的 DSH 配置目录>/profiles/<profile>/local-plugins/dsh-srelay-brief/`
 3. **重启 DSH** → 新开会话，开场应出现 📋 看板 / 决策行
 
@@ -32,12 +32,12 @@
 
 **ZCode 用户**
 
-1. 下载 `zcode-adapter-1.0.0.zip`，解压
+1. 下载 `zcode-adapter-1.0.1.zip`，解压
 2. 在解压出来的 `zcode-adapter/` 里跑两条命令：
 
 ```bash
 node install.mjs            # 先看计划，不写任何东西（dry-run）
-node install.mjs --apply    # 真装：拷文件 + 注册 SessionStart hook
+node install.mjs --apply    # 真装：拷文件 + 注册 SessionStart / UserPromptSubmit 两个 hook
 ```
 
 3. 在真实项目目录里跑一次 `brief.mjs` 验收，或直接新开会话看有没有 📍项目状态简报
@@ -100,6 +100,69 @@ docs/                     架构、工程笔记、常见问题
 release/                  离线包与客户端包说明、发布清单
 ```
 
+
+## 全局经验层（🌍 跨项目经验）
+
+> 记忆原本是**一个项目一个库**——你在 A 项目踩的坑，B 项目完全不知道。
+> 经验层补上这一块：**跨项目、有出处、会挑轻重、还会退休**的`老手经验本`。
+
+### 它收什么
+
+| ✅ 收 | ❌ 不收 |
+|---|---|
+| 环境/工具的事实（本机 pnpm 必须 ≥10.34） | 一次性的具体状态（`今天改了 db.ts`——那是项目记忆的活） |
+| **踩过的坑 + 判据**（自动推翻实测误配 87%，别再试） | 主观评价、未验证的推测 |
+| 操作配方（改完必须跑 X） | 密钥/凭证（只存`去哪儿找`，**永不存值**） |
+| 跨项目都成立的口径（数字必须绑快照与口径） | 模型自己的感想 |
+
+### 四道闸（越往上越权威）
+
+| 闸 | 判据 | 不过会怎样 |
+|---|---|---|
+| **闸 0 出处**（准入） | 必须挂得上可核验出处：真实工具调用记录 / 用户原话逐字 / 文件内容 | 降为 `inferred`，**只能当草稿，永不进注入层** |
+| **闸 1 定级** | `verified-tool` 9.0 / `verified-user` 7.5 / `verified-file` 6.0；阈值 5.5 | 沉到线下（**仍可搜到**，不删） |
+| **闸 2 相关性** | 要与本轮**具体**重合（命中标识符或实词）；**常用词不算数** | 不注入 |
+| **闸 3 人工确认** | `draft` → `verified`，**只有人能升** | **不许升作用域** |
+
+**`不能随便入库`的落地**：模型自动产的一律 `draft`（**不进注入层**，等于候审）；
+升 `verified` 只有两条路——**证据到位** 或 **人工确认**；升作用域必须人工确认；**永不自动删**（退休只是不再默认注入）。
+
+### 作用域
+
+| 作用域 | 谁看得见 | 怎么产生 |
+|---|---|---|
+| `project` | 只有本工作区 | **默认** |
+| `domain` | 同领域标签的项目 | 需证据（同领域 ≥2 个工作区各自确认过） |
+| `global` | 所有项目 | 只有显式升级 |
+
+### 用法
+
+```bash
+SRELAY_GLOBAL_HOME=~/.sessionrelay srelay lesson add "<一句话经验>" --source <出处> --grade verified-user --scope global
+srelay lesson list              # ● 可进注入层 / ○ 已退休（仍可搜）
+srelay lesson search <关键词>    # 换词能命中（复用项目同一套分词器）
+srelay lesson harvest           # 从项目记忆里刨候选（**只产草稿**）
+srelay lesson confirm <id...>   # 人工复核：确认即证据（inferred → verified-file 6.0）
+srelay lesson maintain          # 年龄衰减 / 退休 / 复活
+srelay lesson export            # 导出 Markdown（人可读、可 git、可手改）
+```
+
+### 注入预算（两端不同，都不挤占简报）
+
+| 端 | 时机 | 预算 |
+|---|---|---|
+| **ZCode** | `SessionStart` 开场 | 按**重要度**给最重要的几条（开场还没有`本轮`可言） |
+| **ZCode** | `UserPromptSubmit` **每轮** | 按**相关性**筛（经验 ≤200 字符 / 旧决策 ≤2 条）；**没命中就整段不出现** |
+| **DSH** | 每个模型步骤前 | 按重要度给 ≤200 字符 / ≤3 条 |
+
+### 检索排序：多路融合
+
+候选很多、但注入只放得下几条 —— 决定`放哪几条`的是**融合排序**：
+三条路各报一份名单（FTS 主路 / 改写路 / 不走分词器的子串路），按 `Σ w/(60+rank)` 合成一份，
+**被越多路认、且在各自名单越靠前，就越可信**。长度惩罚进到**每条路内部**（巨型会话在每条路上都是第一名，事后乘系数改不动）。
+
+实测（129 条/臂）：hit@1 **+1.5~7.0 个百分点**、hit@3 +1.5~4.6；hit@10 −1.5~3.9（用尾部换头部，对注入场景正合适）。
+复跑：`npx tsx core/SessionRelay/scripts/recall-bench.ts <库路径> --n 150`。
 ## 实测数字（不是宣传语）
 
 | 项 | 数字 | 怎么来的 |

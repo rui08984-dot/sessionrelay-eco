@@ -19,7 +19,7 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { execSync } from 'node:child_process'
+import { execSync, spawnSync } from 'node:child_process'
 // G 段要直接读各项目库的概况：用内置 node:sqlite（Node ≥22.5）。取不到就把 G 段的统计降级。
 let _DatabaseSync = null
 try { ({ DatabaseSync: _DatabaseSync } = await import('node:sqlite')) } catch { /* 老 Node：G 段仍会打印看板与体积 */ }
@@ -44,7 +44,7 @@ const PLUGIN_COPIES = [
   ['部署 headless profile', path.join(HOME, '.dsh/profiles/headless/local-plugins/dsh-srelay-brief')],
 ]
 
-const PLUGIN_FILES = ['index.js', 'project-resolve.mjs', 'selftest.mjs', 'src/brief-sql.mjs', 'src/tools.js', 'src/state.js', 'src/cli.js', 'src/define-tool.js']
+const PLUGIN_FILES = ['index.js', 'project-resolve.mjs', 'selftest.mjs', 'src/brief-sql.mjs', 'src/tools.js', 'src/state.js', 'src/cli.js', 'src/define-tool.js', 'src/root-rules.mjs']
 
 function md5File(p) {
   try { return createHash('md5').update(fs.readFileSync(p)).digest('hex') } catch { return null }
@@ -422,6 +422,84 @@ try {
   }
   if (ref !== null) say('     （判据：vendor 内每个包声明的 dependencies 都得在 vendor 里找到；缺件 = 运行时会炸，但自检全绿）')
 } catch (e) { say('  （vendor 闭包检查失败：' + String(e && e.message).slice(0, 90) + '）') }
+
+// K 段（2026-10-16 新增）：全局经验库体检。
+// 为什么需要：经验库是**今天新加的第 2 个库**，位置在 ~/.sessionrelay/global.sqlite ——
+// 跟项目库完全分开。新组件最容易被当盲区：库不存在、打不开、或**只剩 0 条**（被误删/误清）时，
+// 简报只是"没有经验段"，看起来一切正常 —— 正是本项目最嫌恶的静默半失效。
+// 判据：库在不在、能不能读、有多少条、多少条够注入线。
+say('')
+say('══════ K. 全局经验库（跨项目，独立于各项目库）══════')
+try {
+  const HOME4 = process.env.USERPROFILE || process.env.HOME
+  const gpath = process.env.SRELAY_GLOBAL_HOME
+    ? path.join(process.env.SRELAY_GLOBAL_HOME, 'global.sqlite')
+    : path.join(HOME4, '.sessionrelay', 'global.sqlite')
+  if (!fs.existsSync(gpath)) {
+    say('  ⚪ 还没有经验库（没记过经验）——' + gpath)
+  } else if (!_DatabaseSync) {
+    say('  ⚪ 当前 Node 无 node:sqlite，跳过读取')
+  } else {
+    const g = new _DatabaseSync(gpath, { readOnly: true })
+    try {
+      const total = Number(g.prepare('SELECT count(*) c FROM lessons').get().c)
+      const inj = Number(g.prepare("SELECT count(*) c FROM lessons WHERE status IN ('verified','confirmed') AND grade <> 'inferred'").get().c)
+      const draft = Number(g.prepare("SELECT count(*) c FROM lessons WHERE status = 'draft'").get().c)
+      const scopes = g.prepare('SELECT scope, count(*) c FROM lessons GROUP BY scope').all()
+      say('  ✅ ' + gpath + '：共 ' + total + ' 条（可注入 ' + inj + ' · 草稿 ' + draft + '）')
+      say('     作用域：' + scopes.map((r) => r.scope + '=' + r.c).join(' · '))
+      if (total === 0) say('  ⚠️  库在但一条都没有（被清过？）')
+    } finally { try { g.close() } catch {} }
+  }
+} catch (e) { say('  ⚠️  经验库读取失败：' + String(e && e.message).slice(0, 80)) }
+
+// L 段（2026-10-16 收口新增）：适配器**能不能拿到核心引擎**。
+// 为什么需要：红队 B 7.2 实测 —— 仓库副本的 ZCode hook 因为少了两个 import，
+// 加载引擎那一段整块抛错、被 catch 吞掉，于是**静默退回旧排序**：输出照常有、日志一片干净，
+// 只有"拿一道能区分两条路的题去问"才发现。这类失效人盯不住，让守门每次替我们问一遍。
+// 判据（全为真才算过）：
+//   ① 仓库 hook 与部署 hook 逐字节一致（曾分叉过：部署 18:49 / 仓库 19:08）；
+//   ② 真跑一次 hook（默认环境、不设任何 SRELAY_*），它必须找到 recall.js（DEBUG 行里 engine=…）；
+//   ③ 插件 vendor 的 recall.js 能被真实 import，且带上闸 2 与工作区解析这几个导出。
+say('')
+say('══════ L. 适配器能否拿到核心引擎（防静默降级）══════')
+try {
+  const zcodeDir = path.join(HOME, '.zcode/hooks/statebrief')
+  const AD_FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs']
+  if (!fs.existsSync(zcodeDir)) {
+    say('  ⚪ 没装 ZCode 适配器（跳过）')
+  } else {
+    for (const f of AD_FILES) {
+      const a = md5File(path.join(ROOT, 'integrations/zcode', f))
+      const b = md5File(path.join(zcodeDir, f))
+      if (a && b && a === b) say('  ✅ ' + f + '：仓库 ⇄ 部署 一致')
+      else { problems++; say('  🔴 ' + f + '：仓库与部署不一致 → node integrations/zcode/install.mjs --apply') }
+    }
+    const rr = spawnSync(process.execPath, [path.join(zcodeDir, 'brief-turn.mjs')], {
+      input: JSON.stringify({ prompt: '闸2 相关性怎么算', cwd: ROOT }),
+      encoding: 'utf8',
+      env: { ...process.env, SRELAY_HOOK_DEBUG: '1' },
+    })
+    const dbg = String(rr.stderr || '')
+    const mm = /engine= (.*)$/m.exec(dbg)
+    const enginePath = mm ? mm[1].trim() : ''
+    if (enginePath && enginePath !== '(无)' && fs.existsSync(enginePath)) {
+      say('  ✅ hook 真跑：引擎来自 ' + enginePath)
+    } else {
+      problems++
+      say('  🔴 hook 真跑没拿到引擎 ⇒ 每轮召回整段不出现（宁可少给，但必须让人看见）')
+    }
+  }
+  const pv = path.join(ROOT, 'plugins/dsh/vendor/dist/recall.js')
+  if (!fs.existsSync(pv)) { problems++; say('  🔴 插件 vendor 里没有 dist/recall.js') }
+  else {
+    const mod = await import(pathToFileURL(pv).href)
+    const need = ['pickForInjection', 'gate2Score', 'resolveWorkspaceId', 'resolveDomain']
+    const miss = need.filter((k) => typeof mod[k] !== 'function')
+    if (miss.length) { problems++; say('  🔴 插件 vendor 的 recall.js 缺导出：' + miss.join(' / ')) }
+    else say('  ✅ 插件 vendor recall.js 导出齐全（' + need.join(' / ') + '）')
+  }
+} catch (e) { problems++; say('  🔴 L 段异常：' + String(e && e.message).slice(0, 120)) }
 
 say('')
 if (problems === 0) say('✅ 全部一致，无需处理')

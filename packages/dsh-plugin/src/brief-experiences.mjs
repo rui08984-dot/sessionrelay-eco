@@ -1,75 +1,57 @@
-// 全局经验段的取数与渲染（DSH 插件侧）
+// 全局经验段（DSH 插件侧）—— **只做渲染与降级，判据一律来自核心库**。
 //
-// 为什么单独一个文件：插件是**自包含**的（不 import 核心库源码），
-// 而经验库在**另一个库**（~/.sessionrelay/global.sqlite）——与项目库同构但不同文件。
-// 口径与核心库 store/global.ts 的 pickForInjection 保持一致，改一处要同步另一处。
+// [1016 收口 · 红队 A-5/B-7] 这里原先有两样"自产"的东西：
+//   ① 一段自己写的可见性 SQL（只有 global + project，**缺 domain 分支**）⇒ `--scope domain`
+//      的经验在 DSH 侧永远不出现，而且没有任何报错；
+//   ② 一套"中文 2 字滑窗 + 任一 bigram 命中即算相关"的打分 ⇒ "我写/么样"这种偶然重合
+//      会把无关经验判成相关（实测写诗题注入了不相干内容）。
+// 现在：可见性、闸 1（状态/定级/阈值）、闸 2（相关性）、预算，**全部调 recall.js 里的同一份实现**
+// （核心库 store/global.ts 的 pickForInjection / visibleWhere / gate2Score）。
 //
-// 三条纪律（来自实测，别改）：
-//   ① **只取 verified/confirmed 且非 inferred** —— 草稿永不进注入层；
-//   ② **相关性要具体**：命中标识符（含 . _ - 的长词）或实词；常用词不算数；
-//   ③ **预算 ≤200 字符 / ≤3 条**，没命中就返回空串（整段不渲染）。
+// 加载：模块顶层 await import 一次；拿不到就没有经验段（见下面的降级说明）。
+// 三条降级纪律：
+//   · recall.js 拿不到 ⇒ 整段不出现。**不退回"按重要度硬塞"** —— 那等于悄悄换一套判据，
+//     而"看起来在工作、其实用的是另一套规则"正是本项目的第一号故障模式。插件自带 vendor
+//     里有 recall.js，守门 J 段（依赖闭包）与 selftest 都会抓它的缺席。
+//   · 有本轮输入、但没有任何经验与它**具体**相关 ⇒ 整段不出现（不硬塞）。
+//   · 冷路径（prompt 组装同步路径）用 { noQuery: true }：不解码会话、不加载分词器，
+//     只按重要度给最重要的几条 —— 这正是设计里"没有查询时"的既定行为，且毫秒级、不阻塞组装。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 
-const COMMON = new Set(['这个','那个','什么','怎么','为什么','可以','需要','应该','我们','你们','他们','现在','然后','没有','不是','还是','或者','因为','所以','但是','如果','已经','还有','就是','一下','东西','时候','问题','这样','那样']);
+const require_ = createRequire(import.meta.url);
+let DatabaseSync = null;
+try { ({ DatabaseSync } = require_('node:sqlite')); } catch { DatabaseSync = null; }
 
-function globalDb() {
+let recall = null;
+try { recall = await import('../vendor/dist/recall.js'); } catch { recall = null; }
+export const __recallAvailable = !!recall;
+
+/** 同步取经验段；库不存在 / 没命中 / 引擎缺席 → 空串（整段不渲染） */
+export function experiencesLine(root, opts = {}) {
+  if (!DatabaseSync || !recall) return '';
   const home = process.env.SRELAY_GLOBAL_HOME || path.join(os.homedir(), '.sessionrelay');
   const f = path.join(home, 'global.sqlite');
-  try { if (!fs.existsSync(f)) return null; } catch { return null; }
-  return f;
-}
-
-/** 取经验段（同步、只读、毫秒级；库不存在/打不开一律返回空串，绝不抛） */
-export function experiencesLine(root, opts = {}) {
-  const f = globalDb();
-  if (!f) return '';
-  let db;
+  try { if (!fs.existsSync(f)) return ''; } catch { return ''; }
+  const ws = String(root || '');
+  let db = null;
   try {
-    const { DatabaseSync } = require('node:sqlite');
     db = new DatabaseSync(f, { readOnly: true });
-  } catch { return ''; }
-  try {
-    const ws = String(root || '');
-    const rows = db.prepare(
-      "SELECT text, scope, grade, importance, uses, hits, created_at FROM lessons "
-      + "WHERE (scope = 'global' OR (scope = 'project' AND workspace_id = ?)) "
-      + "AND status IN ('verified','confirmed') AND grade <> 'inferred' "
-      + 'ORDER BY importance DESC LIMIT 40'
-    ).all(ws);
+    // 本轮用户输入：默认自己去取（recall.js 的逐帧解码），冷路径显式 noQuery 跳过
+    let q = String(opts.query ?? '');
+    if (!q && !opts.noQuery) { try { q = recall.lastUserMessage(ws) || ''; } catch { q = ''; } }
+    q = q.trim();
+    const rows = recall.pickForInjection(db, {
+      workspaceId: recall.resolveWorkspaceId(ws),
+      domain: recall.resolveDomain(ws),
+      query: q || undefined,
+      top: opts.top ?? 3,
+      maxChars: opts.maxChars ?? 200,
+    });
     if (!rows.length) return '';
-    // 年龄衰减 + 复用回血（与核心库同一公式）
-    const now = Date.now();
-    const live = rows.map((r) => ({
-      ...r,
-      live: Number(r.importance) - Math.max(0, (now - Date.parse(r.created_at)) / 86400000) * 0.0083
-        + Math.log1p(Number(r.uses || 0)) * 1.5 + Math.min(1, Number(r.hits || 0) * 0.1),
-    })).filter((r) => r.live >= 5.5);
-    if (!live.length) return '';
-    const q = String(opts.query || '').trim();
-    let ranked = live;
-    if (q) {
-      const toks = q.split(/[\s,，。；;:：!！?？]+/).filter((t) => t.length >= 2 && !COMMON.has(t));
-      const specific = toks.filter((t) => t.length >= 3 || /[._\-/]/.test(t));
-      const scored = live.map((r) => {
-        let hit = 0;
-        for (const t of specific) if (String(r.text).includes(t)) hit += 2;
-        for (const t of toks) if (String(r.text).includes(t)) hit += 1;
-        return { r, hit };
-      }).filter((s) => s.hit > 0);
-      scored.sort((a, b) => b.hit - a.hit || b.r.live - a.r.live);
-      ranked = scored.map((s) => s.r);
-      if (!ranked.length) return '';   // 闸 2：没有具体重合就整段不出现
-    }
-    const picked = [];
-    let used = 0;
-    for (const r of ranked) {
-      const len = String(r.text).length;
-      if (used + len > 200 && picked.length > 0) break;
-      picked.push(r); used += len;
-      if (picked.length >= 3) break;
-    }
-    return '🌍 经验：' + picked.map((r) => r.text).join('；') + String.fromCharCode(10);
-  } catch { return ''; } finally { try { db.close(); } catch {} }
+    const body = rows.map((r) => String(r.text || '')).filter(Boolean).join('；');
+    return body ? '🌍 经验：' + body + String.fromCharCode(10) : '';
+  } catch { return ''; } finally { try { db?.close(); } catch { /* 已关闭 */ } }
 }

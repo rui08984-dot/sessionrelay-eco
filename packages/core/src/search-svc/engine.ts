@@ -96,6 +96,8 @@ export interface SearchOptions {
   rewriteBelow?: number;
   /** [1016] 多路加权融合（默认关：先量再开，见交接 §15/§16） */
   fusion?: boolean;
+  /** [1016 A5] 长度归一化：默认关。129 题自动基准有结构性偏置（出题只取 <=600 条的会话，被罚的巨无霸永远不是答案），红队 B 反向出题（答案是巨无霸）hit@1 -11.9pt；20 问人类基准同代码五配置对照：关 -> 关键词 15/16/20 大白话 12/15/19，开 -> 15/17/18 大白话 10/14/17。净收益只在「答案是小会话」时成立，故保留代码但不做默认。 */
+  lengthNorm?: boolean;
 }
 
 /**
@@ -156,6 +158,20 @@ function searchOnce(db: DB, opts: SearchOptions): SearchHit[] {
   for (const [sid, sc] of metaHits) {
     if (hits.some((h) => h.sessionId === sid)) continue; // messages 优先（T27）
     hits.push({ sessionId: sid, score: sc * 0.5, snippet: '', viaMeta: true, coverage: coverageOf(sid), seq: 0 });
+  }
+
+  // [1016 A5] 长度归一化：BM25 的 b 参数思想——长文档天然容易命中更多词，不打折就会霸榜。
+  // 实测依据：20 问基准里 9/20 的 top1 落在两三千条消息的会话上；且大样本里 RRF 融合
+  // 也栽在这（每条路它都第一）⇒ 必须**在打分阶段**压，而不是事后乘系数。
+  if (opts.lengthNorm === true && hits.length > 0) {
+    const ids = hits.map((h) => h.sessionId);
+    const ph = ids.map(() => String.fromCharCode(63)).join(String.fromCharCode(44));
+    try {
+      const rows = db.prepare(String.fromCharCode(83,69,76,69,67,84) + String.fromCharCode(32,105,100,44,32,109,101,115,115,97,103,101,95,99,111,117,110,116,32,65,83,32,99,32,70,82,79,77,32,115,101,115,115,105,111,110,115,32,87,72,69,82,69,32,105,100,32,73,78,32,40) + ph + String.fromCharCode(41)).all(...ids);
+      const pen = new Map();
+      for (const r of rows as Array<{ id: string; c: number }>) pen.set(r.id, 1 / (1 + Math.log10(1 + Number(r.c || 0) / 300)));
+      for (const h of hits) h.score = h.score * (pen.get(h.sessionId) || 1);
+    } catch { /* 取不到就不惩罚 */ }
   }
 
   hits.sort((a, b) => b.score - a.score || b.coverage - a.coverage);
@@ -299,7 +315,9 @@ function fusedSearch(db: DB, opts: SearchOptions, main: SearchHit[]): SearchHit[
   const paths: Array<{ w: number; hits: SearchHit[] }> = [{ w: 1.0, hits: main }];
   const rw = rewriteQuery(tokens, (t) => segment(t, { keepSingles: false }));
   if (rw.extraUnits.length > 0) {
-    const ex = searchOnce(db, { ...opts, query: rw.extraUnits.flat().join(' '), rewrite: false, limit });
+    // [红队 A-11] 融合路**已经在 rrfFuse 里做过长度惩罚**，这里必须关掉 searchOnce 的那一次，
+    // 否则二次乘罚，且任何 lengthNorm:false 的对照组都是脏的。
+    const ex = searchOnce(db, { ...opts, query: rw.extraUnits.flat().join(' '), rewrite: false, limit, lengthNorm: false });
     if (ex.length > 0) paths.push({ w: 0.6, hits: ex });
   }
 // ⚠️ 查询里有**短语单元**（带引号的多词）时不加子串路：
