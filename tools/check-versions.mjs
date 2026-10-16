@@ -373,6 +373,56 @@ try {
   }
 } catch (e) { say('  （技能副本检查失败：' + String(e && e.message).slice(0, 90) + '）') }
 
+
+// J 段（2026-10-16 新增）：插件 vendor 的**依赖闭包完整性**。
+// 为什么必须有这一段：实测踩到的真 bug —— vendor 生成脚本的闭包循环只扫「顶层依赖名单」，
+// 于是传递依赖（@inquirer/core / ansi / figures / type 等）**永远不会被复制**，
+// 而 vendor 看起来"有货"、所有自检全绿；DSH 里一调用 srelay_record 就炸在模块找不到。
+// 更糟的是部署副本停在 36 个包、作者副本 121 个包——镜像工具明确排除 vendor，没人发现。
+// 判据：把 vendor 里每个包的 dependencies 与"已装包集合"对一遍，缺任何一个都判红。
+say('')
+say('══════ J. 插件 vendor 依赖闭包（防"装了却缺件"）══════')
+try {
+  const HOME3 = process.env.USERPROFILE || process.env.HOME
+  const vendors = [['作者副本', path.join(ROOT, 'plugins/dsh/vendor')]]
+  for (const p of ['web', 'desktop', 'headless']) {
+    vendors.push(['profile ' + p, path.join(HOME3, '.dsh/profiles', p, 'local-plugins/dsh-srelay-brief/vendor')])
+  }
+  const closureOf = (v) => {
+    const nm = path.join(v, 'node_modules')
+    if (!fs.existsSync(nm)) return null
+    const dirs = []
+    for (const e of fs.readdirSync(nm, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name === '.bin') continue
+      if (e.name.startsWith('@')) {
+        for (const s of fs.readdirSync(path.join(nm, e.name), { withFileTypes: true })) if (s.isDirectory()) dirs.push(e.name + '/' + s.name)
+      } else dirs.push(e.name)
+    }
+    const have = new Set(dirs)
+    const missing = new Set()
+    for (const d of dirs) {
+      const pj = path.join(nm, d, 'package.json')
+      if (!fs.existsSync(pj)) continue
+      try {
+        const j = JSON.parse(fs.readFileSync(pj, 'utf8'))
+        for (const dep of Object.keys(j.dependencies ?? {})) if (!have.has(dep)) missing.add(dep)
+      } catch { /* 坏包跳过 */ }
+    }
+    return { n: dirs.length, missing: [...missing] }
+  }
+  let ref = null
+  for (const [label, v] of vendors) {
+    if (!fs.existsSync(v)) { say('  ⚪ ' + label + '：无 vendor（未装/未生成）'); continue }
+    const c = closureOf(v)
+    if (!c) { problems++; say('  🔴 ' + label + '：vendor 里没有 node_modules'); continue }
+    if (ref === null) ref = c.n
+    const okc = c.missing.length === 0
+    if (!okc) problems++
+    say('  ' + (okc ? '✅' : '🔴') + ' ' + label + '：' + c.n + ' 个包' + (okc ? '，闭包完整' : '，缺 ' + c.missing.length + ' 个 → ' + c.missing.slice(0, 6).join(', ')))
+  }
+  if (ref !== null) say('     （判据：vendor 内每个包声明的 dependencies 都得在 vendor 里找到；缺件 = 运行时会炸，但自检全绿）')
+} catch (e) { say('  （vendor 闭包检查失败：' + String(e && e.message).slice(0, 90) + '）') }
+
 say('')
 if (problems === 0) say('✅ 全部一致，无需处理')
 else say(`🔴 发现 ${problems} 处问题，按上面提示修`)
