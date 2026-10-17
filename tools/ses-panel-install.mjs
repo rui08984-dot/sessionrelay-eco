@@ -164,6 +164,35 @@ function verify(profileDir) {
   return { linked: !!real, link, real, pnpmEntry: pnpmHit || null };
 }
 
+
+/**
+ * 已部署的 .pnpm 副本与源码**逐字节比对**（只比 lib/ 下的 js 与 package.json）。
+ *
+ * 为什么必须有这一步（1018 真事故）：「链接已就绪 且 清单没变 ⇒ 跳过安装」这个判据只回答了
+ * 「装过没有」，没回答「装的是不是当前这份」。于是改了 lib/client.js 之后：
+ *   链接在、清单没变 → 整步被跳过 → .pnpm 里那份还是旧的 →
+ *   DSH 重启后加载的仍是旧代码，而安装脚本打印的是「✅ 装好了」。
+ * 实测：源码 44625386…，已部署 951c12e4…，两个 session 都没生效。
+ * 这是本仓反复出现的「判据没有覆盖被判断的对象」的第 7 次。
+ */
+function deployedDrift(profileDir) {
+  const link = path.join(profileDir, 'node_modules', PKG);
+  let real = null;
+  try { real = fs.realpathSync(link); } catch { return { ok: true, drift: [], why: '无链接（无需比内容）' }; }
+  const drift = [];
+  const cmp = (rel) => {
+    const a = path.join(SRC, rel), b = path.join(real, rel);
+    try {
+      if (!fs.existsSync(b)) { drift.push(rel + '(缺)'); return; }
+      const ha = createHash('md5').update(fs.readFileSync(a)).digest('hex');
+      const hb = createHash('md5').update(fs.readFileSync(b)).digest('hex');
+      if (ha !== hb) drift.push(rel);
+    } catch { drift.push(rel + '(读不到)'); }
+  };
+  cmp('package.json');
+  for (const f of fs.readdirSync(path.join(SRC, 'lib'))) if (f.endsWith('.js')) cmp(path.join('lib', f));
+  return { ok: drift.length === 0, drift, real };
+}
 /**
  * 兜底：pnpm 装不动时，**手工铺出与 pnpm 等价的布局**。
  *
@@ -233,11 +262,26 @@ for (const prof of PROFILES) {
     //   —— 也就是说：每跑一次构建管线，就把兄弟插件砸一次。修一次被砸一次。
     // 判据：链接已就绪 **且** profile 清单没变 ⇒ 没有要装的东西 ⇒ 跳过。
     const pre = verify(profileDir);
-    const needInstall = !pre.linked || p.changes.length > 0;
+    // [1018 修「装了但没生效」] 跳过判据补第三条：**已部署内容必须与源码一致**。
+    //   只判「链接在 + 清单没变」会漏掉最常发生的那件事 —— 改了 lib/ 里的代码。
+    //   实测：改了 client.js 后链接一直在、清单没变 ⇒ 整步跳过 ⇒ .pnpm 里还是旧代码，
+    //   而脚本打印「✅ 装好了」，用户重启两次都看不到变化。
+    const drift0 = deployedDrift(profileDir);
+    const needInstall = !pre.linked || p.changes.length > 0 || !drift0.ok;
     let skipNote = '';
     let pi = { ok: true, how: '跳过（无需安装）', out: '', err: '' };
     if (!needInstall) {
-      skipNote = '链接已就绪 · profile 清单未变 —— 没有要装的东西';
+      skipNote = '链接已就绪 · profile 清单未变 · 内容与源码逐字节一致 —— 没有要装的东西';
+    } else if (pre.linked && p.changes.length === 0 && !drift0.ok) {
+      // 只有内容漂了：**手工铺**是最快的修法，而且完全不碰 pnpm（避免连坐兄弟插件）
+      console.log('  ④ 内容漂移 ' + drift0.drift.length + ' 处（' + drift0.drift.slice(0, 3).join(', ') + (drift0.drift.length > 3 ? ' …' : '') + '）→ 强刷');
+      const m = materialize(profileDir);
+      if (m.ok) {
+        console.log('     已逐字节重铺 .pnpm 副本（复制 ' + m.copied + ' · 内核 ' + m.vendor + '）—— 未调用 pnpm');
+        skipNote = '内容已强刷';
+      } else {
+        console.log('     手工重铺失败：' + m.why + ' → 回退 pnpm install');
+      }
     } else {
       console.log('  ④ pnpm install …');
       pi = pnpmInstall(profileDir);

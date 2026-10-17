@@ -763,6 +763,36 @@ try {
 } catch (e) { problems++; say('  🔴 M 段异常：' + String(e && e.message).slice(0, 120)) }
 
 say('')
+say('══════ N. 面板已部署副本是否等于源码（10-18 补）══════')
+// 为什么补：M 段只验「仓库里的 vendor 新不新」，验不到「DSH 真正加载的那份」。
+// 1018 现场就这样卡住的 —— 改了 lib/client.js、跑完安装、重启 DSH，界面还是旧行为；
+// 而所有自检（面板 selftest / check-panel-deps）都在测**作者副本**，全绿。
+// 判据落在 DSH 自身的解析结果上：node_modules/<pkg> → realpath → 比 lib/client.js 的 md5。
+try {
+  const SRC_PANEL = path.join(ROOT, 'integrations/dsh-srelay-panel')
+  const md5f = (f) => createHash('md5').update(fs.readFileSync(f)).digest('hex')
+  const srcHash = md5f(path.join(SRC_PANEL, 'lib/client.js'))
+  let checked = 0, drifted = 0
+  for (const prof of ['web', 'desktop']) {
+    const link = path.join(HOME, '.dsh/profiles', prof, 'node_modules', 'dsh-srelay-panel')
+    if (!fs.existsSync(link)) continue
+    checked++
+    let real = link
+    try { real = fs.realpathSync(link) } catch { /* 保留原样 */ }
+    const f = path.join(real, 'lib', 'client.js')
+    if (!fs.existsSync(f)) { problems++; drifted++; say(`  🔴 ${prof}：解析到的面板里没有 lib/client.js`); continue }
+    const h = md5f(f)
+    if (h !== srcHash) {
+      problems++; drifted++
+      say(`  🔴 ${prof}：DSH 加载的面板 ≠ 源码（源码 ${srcHash.slice(0, 8)}… / 部署 ${h.slice(0, 8)}…）`)
+    }
+  }
+  if (!checked) say('  ⚪ 没有任何 profile 装了面板 —— 跳过')
+  else if (!drifted) say(`  ✅ ${checked} 个 profile 的面板都与源码逐字节一致（client.js ${srcHash.slice(0, 8)}…）`)
+  else say('     → 修：node tools/ses-panel-install.mjs --apply --profiles web,desktop（然后重启 DSH）')
+} catch (e) { say('  （N 段异常：' + String(e && e.message).slice(0, 100) + '）') }
+
+say('')
 if (problems === 0) say('✅ 全部一致，无需处理')
 else say(`🔴 发现 ${problems} 处问题，按上面提示修`)
 process.exit(problems === 0 ? 0 : 1)

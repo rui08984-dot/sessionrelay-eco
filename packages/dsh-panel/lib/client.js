@@ -981,6 +981,9 @@ window.__ModuleLoader__.load({
       const [hover, setHover] = React.useState(null);
       const [dragging, setDragging] = React.useState(false);
       const [size, setSize] = React.useState({ w: 800, h: 480 });
+      // 图结构变更的计数器。绘制 effect 只依赖它，**不依赖 nodes/links 的数组身份** ——
+      // 那两样每 15 秒轮询都会变成新数组，放进去等于每 15 秒重启一次动画循环。
+      const [serial, setSerial] = React.useState(0);
 
       // 尺寸跟随容器：面板宽度是可变的（侧栏收起/展开），写死尺寸会在窄屏炸掉。
       React.useEffect(() => {
@@ -1007,17 +1010,45 @@ window.__ModuleLoader__.load({
       // 看起来像垃圾而不是结构。
       React.useEffect(() => {
         if (!nodes.length) return undefined;
+
+        // ⚠️ [1021 修「图谱会乱跳 / 跟疯了一样」—— 真正的病根在这里，不是拖拽]
+        //
+        //   GraphView 用 useApi('graph', …, 15000) **每 15 秒轮询一次**，每次返回全新的
+        //   data 对象，于是 data.nodes || [] 是个**新数组**。本 effect 依赖 [nodes, links]，
+        //   于是每 15 秒就整套重建一次图 —— 而重建时 x/y 是 Math.random() 撒出来的。
+        //   结果：整个图每 15 秒**瞬移到一组新随机位置**（用户说的『刷新时跳一下』）；
+        //   如果这时候正按着某个节点拖，那颗点的坐标被重置、fixed 被清 → 满屏乱窜。
+        //
+        //   修法两条，缺一不可：
+        //     ① 数据**没变**就别重建（按节点名 + 边对做签名比较）；
+        //     ② 真要重建（换项目 / 点了重建标签）时，**按节点名继承旧坐标**，
+        //        只给新出现的节点撒随机位置 —— 这样图会长大，但不会瞬移。
+        const SIG_SEP = String.fromCharCode(1), SIG_SEP2 = String.fromCharCode(2);
+        const sig = nodes.map((x) => String(x.name || '')).join(SIG_SEP)
+          + SIG_SEP2 + links.map((l) => l.a + ',' + l.b).join(';');
+        const prevSim = simRef.current;
+        if (prevSim && prevSim.sig === sig && prevSim.w === size.w && prevSim.h === size.h) {
+          return undefined;   // 数据与画布都没变：保留现有模拟（含速度、热量、拖拽状态）
+        }
+        const oldPos = new Map();
+        if (prevSim) for (const p of prevSim.nodes) oldPos.set(String(p.name || ''), p);
         const maxS = Math.max(1, ...nodes.map((x) => x.sessions || 0));
+        const clampX = (v) => Math.max(20, Math.min(Math.max(21, size.w - 20), v));
+        const clampY = (v) => Math.max(20, Math.min(Math.max(21, size.h - 20), v));
         const N = nodes.map((nd, i) => {
           const ang = (i / nodes.length) * Math.PI * 2;
           const rad = Math.min(size.w, size.h) * 0.34;
+          const old = oldPos.get(String(nd.name || ''));
+          const keep = !!(old && Number.isFinite(old.x) && Number.isFinite(old.y));
           return {
             ...nd,
-            x: size.w / 2 + Math.cos(ang) * rad * (0.55 + Math.random() * 0.6),
-            y: size.h / 2 + Math.sin(ang) * rad * (0.55 + Math.random() * 0.6),
-            vx: 0, vy: 0,
-            fixed: false,
-            phase: Math.random() * Math.PI * 2,   // 呼吸用的相位，让每个点节奏不同
+            // 老节点沿用旧坐标（画布变了就夹回边界内）；新节点才撒随机位置
+            x: keep ? clampX(old.x) : size.w / 2 + Math.cos(ang) * rad * (0.55 + Math.random() * 0.6),
+            y: keep ? clampY(old.y) : size.h / 2 + Math.sin(ang) * rad * (0.55 + Math.random() * 0.6),
+            vx: keep ? (old.vx || 0) * 0.3 : 0,
+            vy: keep ? (old.vy || 0) * 0.3 : 0,
+            fixed: false,                         // 重建后一律解除钉住（旧对象已不在图上）
+            phase: keep ? old.phase : Math.random() * Math.PI * 2,
             r: 4 + 14 * Math.sqrt((nd.sessions || 0) / maxS),
           };
         });
@@ -1077,7 +1108,9 @@ window.__ModuleLoader__.load({
         const maxS2init = Math.max(1, ...N.map((x) => x.sessions || 1));
         const labSet = new Set(N.map((x, i) => ({ i, s: x.sessions || 0 }))
           .sort((a, b) => b.s - a.s).slice(0, 22).map((x) => x.i));
-        simRef.current = { nodes: N, links: L, bridges, deg, labSet, maxS2init, heat: 1 };
+        // sig/w/h 一起存：下一轮轮询回来时用它判断"到底要不要重建"
+        simRef.current = { nodes: N, links: L, bridges, deg, labSet, maxS2init, heat: 1, sig, w: size.w, h: size.h };
+        setSerial((s) => s + 1);   // 通知绘制 effect：图换了，重启动画循环
         // 重建 sim 时必须清拖拽状态：否则 dragRef 指着**已经不在新图里**的节点对象
         return () => { simRef.current = null; dragRef.current = null; };
       }, [nodes, links, size.w, size.h]);
@@ -1280,7 +1313,7 @@ window.__ModuleLoader__.load({
         };
         raf = requestAnimationFrame(tick);
         return () => { alive = false; cancelAnimationFrame(raf); };
-      }, [size.w, size.h, nodes, links]);
+      }, [size.w, size.h, serial]);
 
       // 命中测试：平方距离，命中半径放宽 1.8 倍（小点也能点到）
       const hitAt = (clientX, clientY) => {
