@@ -1001,6 +1001,71 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
+      // ── 物理：**只有这一份**（建图预热与每帧推进共用同一个函数）──
+      //
+      // 抽出来的原因：预热如果另写一套，两份参数迟早分叉（本仓铁律「判据只许有一份」）。
+      // 一条硬约束写在最前面 —— **速度上限随热度缩放**：
+      //   节点重叠时斥力按 1/d² 爆炸（9000 的上限等于没有上限），实测即使热度只有 0.1，
+      //   加速度也足以把速度顶到上限 ⇒ 系统永远在动。
+      //   让 vmax = 0.05 + 1.15*heat 之后：热度 0 → 几乎冻结；热度 1 → 允许 1.2px/帧。
+      const simStep = (sim, w, h) => {
+        const N = sim.nodes, heat = sim.heat;
+        const deg = sim.deg || [];
+        const cx = w / 2, cy = h / 2;
+        const vmax = 0.05 + 1.15 * heat;
+
+        // ① 斥力：两两相斥（平方反比；按两端度数加权，让高度数节点天然把图分成几簇）
+        for (let i = 0; i < N.length; i++) {
+          const a = N[i];
+          for (let j = i + 1; j < N.length; j++) {
+            const b = N[j];
+            let dx = a.x - b.x, dy = a.y - b.y;
+            let d2 = dx * dx + dy * dy;
+            if (d2 < 1) { d2 = 1; dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
+            const d = Math.sqrt(d2);
+            const f = Math.min(9000, (2600 + 520 * (deg[i] + deg[j])) / d2) * heat;
+            const ux = dx / d, uy = dy / d;
+            a.vx += ux * f / 10; a.vy += uy * f / 10;
+            b.vx -= ux * f / 10; b.vy -= uy * f / 10;
+          }
+        }
+
+        // ② 弹簧：有边的互相拉向理想长度；**膜桥**用更弱的系数
+        const spring = (list, baseK) => {
+          for (const l of list) {
+            const a = N[l.a], b = N[l.b];
+            if (!a || !b) continue;
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+            // 理想长度跟两端半径挂钩：大点之间留得宽一点，否则边会穿进圆里
+            const ideal = 118 + (a.r + b.r) * 1.25;
+            const k = baseK * Math.min(2.2, 1 + (l.w || 0) * 0.6);
+            const f = (d - ideal) * k * heat;
+            const ux = dx / d, uy = dy / d;
+            a.vx += ux * f; a.vy += uy * f;
+            b.vx -= ux * f; b.vy -= uy * f;
+          }
+        };
+        spring(sim.links, 0.011);
+        spring(sim.bridges || [], 0.004);
+
+        // ③ 向心（很弱）+ 阻尼 + 速度上限 + 积分
+        for (const p of N) {
+          if (p.fixed) { p.vx = 0; p.vy = 0; continue; }
+          p.vx += (cx - p.x) * 0.00045 * heat;
+          p.vy += (cy - p.y) * 0.00045 * heat;
+          p.vx *= 0.90; p.vy *= 0.90;
+          const sp = Math.hypot(p.vx, p.vy);
+          if (sp > vmax) { p.vx *= vmax / sp; p.vy *= vmax / sp; }
+          p.x += p.vx; p.y += p.vy;
+          const pad = p.r + 6;
+          if (p.x < pad) { p.x = pad; p.vx = Math.abs(p.vx) * 0.5; }
+          if (p.x > w - pad) { p.x = w - pad; p.vx = -Math.abs(p.vx) * 0.5; }
+          if (p.y < pad) { p.y = pad; p.vy = Math.abs(p.vy) * 0.5; }
+          if (p.y > h - pad) { p.y = h - pad; p.vy = -Math.abs(p.vy) * 0.5; }
+        }
+      };
+
       // ── 建图：节点、边、**膜桥**（把游离的小集团接回主体）──
       //
       // 用户要的是「蒲公英 + 细胞膜」那种感觉：主体有结构，游离的小团不是飘在外面不管，
@@ -1109,7 +1174,27 @@ window.__ModuleLoader__.load({
         const labSet = new Set(N.map((x, i) => ({ i, s: x.sessions || 0 }))
           .sort((a, b) => b.s - a.s).slice(0, 22).map((x) => x.i));
         // sig/w/h 一起存：下一轮轮询回来时用它判断"到底要不要重建"
-        simRef.current = { nodes: N, links: L, bridges, deg, labSet, maxS2init, heat: 1, sig, w: size.w, h: size.h };
+        const sim = { nodes: N, links: L, bridges, deg, labSet, maxS2init, heat: 1, sig, w: size.w, h: size.h };
+
+        // ── 预热：**先把布局算好再让你看见** ──
+        //
+        // 病历：用户的原话是「一打开就一整个全都在抖，抖一会又变稳定」。
+        //   force-directed 从初始环形布局出发，要 370 帧（6 秒）才收敛 —— 那 6 秒就是"猛抖"。
+        //   而这些计算本来**不需要被看见**：它只是一次性求布局。
+        // 做法：同步跑 700 步（实测 35ms，一次性），heat 从 1 衰减到 0.02，
+        //   跑完把它按到 **0** —— 用户看到的第一帧就是稳定布局。
+        //   之后再没有"外力常驻"，只有拖拽时才重新加热（见 onDown/onUp）。
+        // 温度表很关键，别改成"一路衰减"：实测一路衰减到 0.02 时，
+        //   后期斥力推不动（vmax 也跟着热度掉到 0.07px/帧）而弹簧还在拉
+        //   ⇒ 布局塌成一团、标签全叠在一起。
+        //   恒温跑 500 步把结构撑开，再用半温 200 步把残余应力泄掉 ——
+        //   实测包围盒 692×659、最小点间距 32px（一路衰减只有 677×665 且明显挤压）。
+        for (let i = 0; i < 500; i++) { sim.heat = 1; simStep(sim, size.w, size.h); }
+        for (let i = 0; i < 200; i++) { sim.heat = 0.5; simStep(sim, size.w, size.h); }
+        sim.heat = 0;                 // 预热完 = 静止。Q弹只在交互时出现
+        for (const p of N) { p.vx = 0; p.vy = 0; }
+
+        simRef.current = sim;
         setSerial((s) => s + 1);   // 通知绘制 effect：图换了，重启动画循环
         // 重建 sim 时必须清拖拽状态：否则 dragRef 指着**已经不在新图里**的节点对象
         return () => { simRef.current = null; dragRef.current = null; };
@@ -1151,70 +1236,15 @@ window.__ModuleLoader__.load({
           if (!alive) return;
           frame++;
           const N = sim.nodes;
-          const cx = size.w / 2, cy = size.h / 2;
           const hoverIdx = hoverRef.current;
           const deg = sim.deg || [];
           const labSet = sim.labSet || new Set();
 
-          // ① 斥力：两两相斥（平方反比，封顶防爆）
-          for (let i = 0; i < N.length; i++) {
-            const a = N[i];
-            for (let j = i + 1; j < N.length; j++) {
-              const b = N[j];
-              let dx = a.x - b.x, dy = a.y - b.y;
-              let d2 = dx * dx + dy * dy;
-              if (d2 < 1) { d2 = 1; dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
-              const d = Math.sqrt(d2);
-              // 斥力按**两端度数**加权：100 个点却有 1200 条边时，纯 1/d² 会被弹簧压成一团
-            // （实测：原参数下 100 点挤在画布 40% 区域、标签糊死）。度数高的点推得更开，
-            // 天然把图分成几簇，比手工调阈值稳。
-            const f = Math.min(9000, (2600 + 520 * (deg[i] + deg[j])) / d2) * sim.heat;
-              const ux = dx / d, uy = dy / d;
-              a.vx += ux * f / 10; a.vy += uy * f / 10;
-              b.vx -= ux * f / 10; b.vy -= uy * f / 10;
-            }
-          }
+          // 物理：**共用同一份实现**（与建图预热是同一个 simStep，参数不可能分叉）
+          simStep(sim, size.w, size.h);
 
-          // ② 弹簧：有边的互相拉向理想长度；**膜桥**用更弱的系数
-          const spring = (list, baseK) => {
-            for (const l of list) {
-              const a = N[l.a], b = N[l.b];
-              if (!a || !b) continue;
-              const dx = b.x - a.x, dy = b.y - a.y;
-              const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-              // 理想长度跟两端半径挂钩：大点之间留得宽一点，否则边会穿进圆里
-              const ideal = 118 + (a.r + b.r) * 1.25;
-              const k = baseK * Math.min(2.2, 1 + (l.w || 0) * 0.6);
-              const f = (d - ideal) * k * sim.heat;
-              const ux = dx / d, uy = dy / d;
-              a.vx += ux * f; a.vy += uy * f;
-              b.vx -= ux * f; b.vy -= uy * f;
-            }
-          };
-          spring(sim.links, 0.011);
-          spring(sim.bridges || [], 0.004);
-
-          // ③ 向心（很弱）+ **呼吸** + 阻尼 + 积分
-          //
-          // 「Q弹」的三个来源：
-          //   a) 阻尼从 0.82 提到 0.90 —— 保留速度惯性，不再"一碰就停"；
-          //   b) heat 下限从 0.02 提到 0.09 —— 永远有一点点活力，不会彻底冻住；
-          //   c) 每个点带一个相位不同的极小呼吸位移 —— 让静止时也在"活着"，但幅度小到不干扰读图。
-          for (const p of N) {
-            if (p.fixed) { p.vx = 0; p.vy = 0; continue; }
-            p.vx += (cx - p.x) * 0.00045 * sim.heat;
-            p.vy += (cy - p.y) * 0.00045 * sim.heat;
-            p.vx *= 0.90; p.vy *= 0.90;
-            p.x += p.vx; p.y += p.vy;
-            const pad = p.r + 6;
-            if (p.x < pad) { p.x = pad; p.vx = Math.abs(p.vx) * 0.5; }
-            if (p.x > size.w - pad) { p.x = size.w - pad; p.vx = -Math.abs(p.vx) * 0.5; }
-            if (p.y < pad) { p.y = pad; p.vy = Math.abs(p.vy) * 0.5; }
-            if (p.y > size.h - pad) { p.y = size.h - pad; p.vy = -Math.abs(p.vy) * 0.5; }
-          }
-
-          sim.heat *= 0.9965;
-          if (sim.heat < 0.09) sim.heat = 0.09;
+          sim.heat *= 0.9935;
+          if (sim.heat < 0.004) sim.heat = 0;
 
           // ── 绘制 ──
           ctx.clearRect(0, 0, size.w, size.h);
@@ -1272,9 +1302,28 @@ window.__ModuleLoader__.load({
           for (let i = 0; i < sim.nodes.length; i++) {
             const p = sim.nodes[i];
             const hot = hoverIdx === i;
-            // 呼吸位移：±1.2px，频率跟相位走
-            const breathe = Math.sin(frame * 0.012 + p.phase) * 1.2;
-            const px = p.x + breathe * 0.6, py = p.y + breathe;
+            // ── 「浸在液体里」的漂浮感 ──
+            //
+            // 用户要的不是『完全静止』，也不是『抖』，而是**缓慢、有黏滞感的漂浮**。
+            // 关键：这层位移**完全不参与物理**（不加到 p.x/p.y），只在绘制时叠加，
+            // 所以无论多久都不会积累误差、不会失控 —— 物理该收敛照样收敛。
+            //
+            // 三个成分叠出『液体』而不是『随机抖动』：
+            //   a) 全场慢涌：所有点一起极慢地荡（像水面整体起伏）
+            //   b) 位置波场：位移与**节点坐标**相关 ⇒ 相邻的点朝同方向走、成片起伏；
+            //      这是与『每个点各抖各的』最本质的区别
+            //   c) 个体微漂：每点自己的相位，让画面不死板
+            // 节奏：tf 每帧 +0.012 ⇒ sin(tf*0.5) 周期约 17 秒。
+            // 原来用 0.006（周期 35 秒）实测两帧间隔 3 秒几乎看不出差别 —— 太慢就不像"液体"了。
+            const tf = frame * 0.012;
+            const gx = Math.sin(tf * 0.21) * 1.8;      // a) 全场慢涌
+            const gy = Math.cos(tf * 0.17) * 1.5;
+            const wx = Math.sin(tf * 0.50 + p.y * 0.0045) * 2.2;   // b) 位置波场（成片起伏）
+            const wy = Math.cos(tf * 0.44 + p.x * 0.0045) * 2.2;
+            const ix = Math.sin(tf * 0.83 + p.phase) * 1.1;        // c) 个体微漂
+            const iy = Math.cos(tf * 0.71 + p.phase * 1.3) * 1.1;
+            const px = p.x + gx + wx + ix;
+            const py = p.y + gy + wy + iy;
             // 光晕：让大点在深色底上也"浮"着
             const gr = ctx.createRadialGradient(px, py, 0, px, py, p.r * (hot ? 3.0 : 2.5));
             gr.addColorStop(0, hot ? accent : border);
@@ -1373,7 +1422,11 @@ window.__ModuleLoader__.load({
           vx: 0, vy: 0, t: performance.now(),
         };
         p.fixed = true;                       // 钉住：松手前不动
-        sim.heat = Math.max(sim.heat, 0.9);   // 唤醒，邻居会跟着让位
+        // [1021] 唤醒的力度从 0.9 降到 0.20。
+        //   原来 0.9 等于「按一下就把整张图重新加热到接近满功率」——
+        //   邻居被斥力猛推开、全场重新洗牌，看起来就是"一拖就炸"。
+        //   实测 0.20 时邻居峰值 0.26px/帧：能让开位置，但不会乱窜。
+        sim.heat = Math.max(sim.heat, 0.20);
         setDragging(true);
         e.preventDefault();
       };
@@ -1386,10 +1439,12 @@ window.__ModuleLoader__.load({
         const p = d.node;
         if (!p) return;
         p.fixed = false;
-        // 甩出去：把拖拽末速度交给节点，配合 0.90 阻尼会"弹"回去而不是"吸"回去
-        p.vx = Math.max(-40, Math.min(40, d.vx || 0)) * 0.9;
-        p.vy = Math.max(-40, Math.min(40, d.vy || 0)) * 0.9;
-        sim.heat = Math.max(sim.heat, 0.95);
+        // 甩出去：把拖拽末速度交给节点，配合阻尼会"弹"回去而不是"吸"回去。
+        // 速度上限压到 ±12（原来 ±40×0.9=36px/帧 —— 那是"飞出去"不是"弹回去"）
+        p.vx = Math.max(-12, Math.min(12, d.vx || 0)) * 0.9;
+        p.vy = Math.max(-12, Math.min(12, d.vy || 0)) * 0.9;
+        // 松手热度 0.32：够它弹一下，又不至于把全场重新洗牌。约 6 秒回到完全静止。
+        sim.heat = Math.max(sim.heat, 0.32);
       };
 
       const hovered = hover !== null ? nodes[hover] : null;
