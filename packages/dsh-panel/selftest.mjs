@@ -81,7 +81,11 @@ const cp = await call('compression', { root: anyProject });
 const cd = cp.json && cp.json.data;
 ok('返回 ok', !!(cp.json && cp.json.ok), JSON.stringify(cp.json && cp.json.error));
 ok('L0/L2/老化计划三段都有', !!(cd && cd.l0 && cd.l2 && cd.aging));
-ok('L1 如实标成"已否决"（不许显示成在跑）', cd && cd.layers.some((l) => l.id === 'L1' && l.status === 'rejected'));
+// [1021] L1 近重复合并**已默认开启**（原来这里是断言 status==='rejected'）。
+// 断言变了，判据没变：仍然要求面板**如实反映**内核的真实状态 —— 只是真值从"否决"变成"在跑"。
+// 反向断言也留着：L3（有损压缩）必须仍是 off，否则说明默认档被谁悄悄打开了。
+ok('L1 如实标成"在跑"（默认已开）', cd && cd.layers.some((l) => l.id === 'L1' && l.status === 'on'));
+ok('L3 有损压缩仍是 off（默认档不许偷偷开有损）', cd && cd.layers.some((l) => l.id === 'L3' && l.status === 'off'));
 ok('老化热窗与 ADR-003 一致（30 天 / 强度门 0.667）', cd && cd.aging.hotDays === 30 && cd.aging.hotGate === 0.667, JSON.stringify(cd && cd.aging));
 ok('缺参数时给的是错误对象（不是空数据）', (await call('compression', {})).json.ok === false);
 
