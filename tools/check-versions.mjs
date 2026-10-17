@@ -716,6 +716,53 @@ try {
 } catch (e) { problems++; say('  🔴 L 段异常：' + String(e && e.message).slice(0, 120)) }
 
 say('')
+say('══════ M. 面板 vendor 是否跟得上内核 dist（10-18 补）══════')
+// 为什么补这一项：面板**唯一取数实现**是 vendor/dist/panel.js（从 core/SessionRelay/dist 同步）。
+// 但整套守门里此前**一个字都没提 panel** —— 也就是说面板 vendor 漂了没人知道。
+// 而它的故障形态是最坏的那种：插件照常加载、面板照常渲染，只是**所有数字都是旧内核算的**。
+//   这已经是本仓反复出现的第 6 次「判据没有覆盖被判断的对象」：
+//   插件 vendor 有 L 段查，面板 vendor 没有。
+// 比对口径用 **md5**（本仓铁律：文件比对不用 mtime —— 实测 vendor 的 mtime 比内核旧 48 分钟
+//   但内容分毫不差，纯 mtime 判定会天天假红）。
+try {
+  const PANEL_DIR = path.join(ROOT, 'integrations/dsh-srelay-panel/vendor/dist')
+  const CORE_DIST = path.join(ROOT, 'core/SessionRelay/dist')
+  if (!fs.existsSync(PANEL_DIR)) {
+    problems++; say('  🔴 面板没有 vendor/dist —— 面板会加载失败；跑 node tools/ses-panel-install.mjs --apply')
+  } else {
+    const md5 = (f) => createHash('md5').update(fs.readFileSync(f)).digest('hex')
+    const src = path.join(CORE_DIST, 'panel.js')
+    const dst = path.join(PANEL_DIR, 'panel.js')
+    if (!fs.existsSync(src)) { say('  ⚪ 内核没构建（core/SessionRelay/dist 缺 panel.js）——跳过') }
+    else if (!fs.existsSync(dst)) { problems++; say('  🔴 面板 vendor 里没有 panel.js') }
+    else {
+      // ① 入口必须逐字节一致
+      const hs = md5(src), hd = md5(dst)
+      if (hs !== hd) {
+        problems++
+        say('  🔴 面板 vendor 的 panel.js 与内核 dist **不一致**（面板跑的是旧内核逻辑）')
+        say('     → 修：node tools/ses-panel-install.mjs --apply')
+      } else {
+        // ② 还要求整包文件集一致：只比入口会漏掉"入口没变但 chunk 少了/多了"的半同步状态
+        const a = new Set(fs.readdirSync(CORE_DIST).filter((f) => f.endsWith('.js')))
+        const b = new Set(fs.readdirSync(PANEL_DIR).filter((f) => f.endsWith('.js')))
+        const miss = [...a].filter((f) => !b.has(f))
+        const extra = [...b].filter((f) => !a.has(f))
+        if (miss.length || extra.length) {
+          problems++
+          say(`  🔴 面板 vendor 文件集与内核不一致（缺 ${miss.length} 个、多 ${extra.length} 个）`)
+          if (miss.length) say('     缺：' + miss.slice(0, 5).join(', ') + (miss.length > 5 ? ' …' : ''))
+          if (extra.length) say('     多：' + extra.slice(0, 5).join(', ') + (extra.length > 5 ? ' …' : ''))
+          say('     → 修：node tools/ses-panel-install.mjs --apply')
+        } else {
+          say(`  ✅ 面板 vendor 与内核 dist 一致（panel.js md5 ${hd.slice(0, 8)}… · ${a.size} 个 js）`)
+        }
+      }
+    }
+  }
+} catch (e) { problems++; say('  🔴 M 段异常：' + String(e && e.message).slice(0, 120)) }
+
+say('')
 if (problems === 0) say('✅ 全部一致，无需处理')
 else say(`🔴 发现 ${problems} 处问题，按上面提示修`)
 process.exit(problems === 0 ? 0 : 1)

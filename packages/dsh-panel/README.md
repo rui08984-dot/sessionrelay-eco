@@ -17,6 +17,31 @@ curl http://127.0.0.1:19387/srelay/api/diagnostics   # coreLoaded:true、driver:
 node integrations/dsh-srelay-panel/selftest.mjs      # 45 项真 HTTP（不需要重启 DSH）
 ~~~
 
+## 改完代码之后（**必读**，否则你改的东西不会生效）
+
+面板分成两半，**改哪半边，重新生成的方式完全不同**：
+
+| 你改了什么 | 必须做什么 | 为什么 |
+|---|---|---|
+| `lib/client.js`（界面 / 图谱 / 样式） | 只重装：`node tools/ses-panel-install.mjs --apply` + **重启 DSH** | 客户端半在宿主启动时加载，不重启不换 |
+| `lib/index.js`（路由 / 白名单动作） | 同上 | 同上 |
+| `core/SessionRelay/src/panel/*`（取数逻辑） | 先 `cd core/SessionRelay && npm run build`，**再**重装 | 面板的取数实现是 `vendor/dist/panel.js`，它是内核构建产物的**副本** |
+
+⚠️ **最容易踩的坑**：改完 `core/SessionRelay/src/panel/*` 只重启 DSH、不重新同步 vendor ——
+面板会**正常打开、正常显示**，但每个数字都是旧内核算的，而界面上没有任何报错。
+这种"静默半失效"正是本仓守门 M 段要抓的：
+
+~~~bash
+node tools/check-versions.mjs      # M 段：面板 vendor 与内核 dist 逐字节 + 文件集比对
+~~~
+
+不一致时会红并直接给出修法。**不要靠 mtime 判断新鲜度** —— 实测 vendor 的 mtime 可以比内核旧
+48 分钟而内容分毫不差（同步时跳过相同文件），按时间判会天天假红。
+
+> 发布包里 `packages/dsh-panel/vendor/` 是**进 git 的**（别人装包时没有内核源码可同步）。
+> 所以改了内核面板逻辑之后，除了重新 vendor，还要重新生成发布树：
+> `node tools/ses-publish.mjs --out <目标> --force`。
+
 ## 它由什么组成
 
 | 半边 | 文件 | 干什么 |

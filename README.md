@@ -15,10 +15,16 @@
 | **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.3.zip** | 每轮自动把项目简报注入 system prompt + 图形面板 | ~21MB（自带运行时） | 否 |
 | **ZCode** | **zcode-adapter-1.0.2.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~32KB | 否 |
 | **Codex** | **codex-adapter-1.0.0.zip** | 开场简报 + 13 个 MCP 工具 + 交接技能 | ~35KB | **是** |
+| DSH 想要**图形面板** | **dsh-panel-0.1.0.zip** | 记忆台：图谱（可拖拽）/ 看板 / 经验 / 28 个旋钮 | ~0.3MB | 否 |
 | 全都用 / 新机器一次装齐 | **ses-offline-\<日期\>.zip** | 全家桶：内核产物 + 插件 + 适配器 + 技能 + 工具 | ~20MB | — |
 
-四个包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
-**三个客户端都还需要内核**（记忆本体）——从源码装一次即可，见下面「三分钟装上」。
+这些包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
+**所有客户端都还需要内核**（记忆本体）——从源码装一次即可，见下面「三分钟装上」。
+想直接读源码的话，monorepo 里对应 `packages/dsh-plugin` / `packages/dsh-panel` / `packages/zcode-adapter` / `packages/codex-adapter`。
+
+> **面板用户先看这条**：`dsh-panel` 是**独立的第二件东西**，装 DSH 插件不会自动带上它。
+> 它需要 DSH 插件已经装好（面板从插件的 `vendor/dist/srelay.js` 取数），然后单独装面板、再重启 DSH。
+> 不装它的症状是「DSH 里没有『记忆台』图标」—— 插件本身完全正常。
 
 > **Codex 用户先看这条**：装完还必须在 Codex 里输入 `/hooks` 手动 trust 一次，钩子才会运行。
 > 不 trust 的症状是「装好了但什么都没注入」—— 不是坏了，是还没批准。
