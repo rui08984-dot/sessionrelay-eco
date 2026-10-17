@@ -27,9 +27,13 @@ import { pathToFileURL, fileURLToPath } from 'node:url'
 
 // [B3] 一次性探针会话的判据：从核心库构建产物取（**不另写一套** —— 判据只有一处）
 let PROBE_SQL = '(1=0)'
+// [红队第二轮 P2] 项目候选列表也从内核取 —— 否则守门要自己拼 ~/.sessionrelay-registry，
+// 那就是「判据第二份」。取不到就退回空数组（第三节会回退到 cwd）。
+let registryCandidates = () => []
 try {
   const coreEntry = await import(pathToFileURL(path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), 'core/SessionRelay/dist/recall.js')).href)
   if (typeof coreEntry.PROBE_SQL === 'string') PROBE_SQL = coreEntry.PROBE_SQL
+  if (typeof coreEntry.registryCandidates === 'function') registryCandidates = coreEntry.registryCandidates
 } catch { /* 核心库没构建：退化为"不排除任何会话"，本节只是通报 */ }
 
 const ROOT = 'D:/dsh插件  记忆'
@@ -136,25 +140,40 @@ try {
   //   **判据（有没有那个进程）没覆盖被判断的对象（采集有没有在工作）**。
   //   我们要的答案是"记忆有没有在进"，不是"有没有一个叫 watch 的进程"。
   // 判据：近 30 分钟内有过入库 ⇒ 采集活着，不管是谁干的（独立守护 / 宿主内 hooks / serve 侧同步）。
+  // [红队第二轮 P1+P2 修] 原来这段有两个错，叠起来等于**没修**：
+  //   P1: 在 .mjs 里写 require('node:sqlite') → ReferenceError，被自己的 catch 吞成 null。
+  //       讽刺的是本文件顶部 :24-25 早就 await import 拿到了 _DatabaseSync，这里没用。
+  //   P2: 读 process.cwd() 的库。但 ses-rebuild 以**仓库根**为 cwd 跑守门，
+  //       于是它读的是仓库自己的库（实测 7 小时没入库），而 hooks 真正写的是当前项目库。
+  //       ⇒ 口径与被判断对象无关，第三信号在正式入口下恒 false。
+  // 正解：用顶部的 _DatabaseSync；把「最近的入库」定义成**登记表里所有项目库的最新一条**
+  //   —— 这才等于用户真正问的那句"记忆有没有在进"。
   const recentIngest = (() => {
-    try {
-      const dbPath = path.join(process.cwd(), '.sessionrelay', 'relay.sqlite')
-      if (!fs.existsSync(dbPath)) return null
-      const { DatabaseSync } = require('node:sqlite')
-      const db = new DatabaseSync(dbPath, { readOnly: true })
+    if (!_DatabaseSync) return null
+    let roots = []
+    try { roots = registryCandidates().map((c) => c.root) } catch { return null }
+    if (!roots.length) roots = [process.cwd()]
+    let best = -Infinity
+    for (const r of roots) {
       try {
-        const row = db.prepare('SELECT MAX(created_at) AS m FROM messages').get()
-        const t = row && row.m ? Date.parse(String(row.m)) : NaN
-        if (!Number.isFinite(t)) return null
-        return { agoMin: Math.round((Date.now() - t) / 60000) }
-      } finally { try { db.close() } catch { /* 已关 */ } }
-    } catch { return null }
+        const f = path.join(r, '.sessionrelay', 'relay.sqlite')
+        if (!fs.existsSync(f)) continue
+        const db = new _DatabaseSync(f, { readOnly: true })
+        try {
+          const row = db.prepare('SELECT MAX(created_at) AS m FROM messages').get()
+          const t = row && row.m ? Date.parse(String(row.m)) : NaN
+          if (Number.isFinite(t) && t > best) best = t
+        } finally { try { db.close() } catch { /* 已关 */ } }
+      } catch { /* 单个库坏了不影响其它 */ }
+    }
+    if (!Number.isFinite(best)) return null
+    return { agoMin: Math.round((Date.now() - best) / 60000), projects: roots.length }
   })()
   const ingestAlive = !!(recentIngest && recentIngest.agoMin <= 30)
   if (!lines.length && !lockAlive.ok && !ingestAlive) {
     problems++; say('  🔴 采集没有在跑（进程表、锁心跳、近 30 分钟入库 —— 三者都没有）')
   } else if (!lines.length && !lockAlive.ok && ingestAlive) {
-    say(`  ✅ 采集在跑：宿主内采集（近 ${recentIngest.agoMin} 分钟有入库；无独立 watch 进程、锁心跳不动 —— DSH 插件 hooks 接管的正常形态）`)
+    say(`  ✅ 采集在跑：宿主内采集（${recentIngest.projects} 个项目里最近 ${recentIngest.agoMin} 分钟有入库；无独立 watch 进程、锁心跳不动 —— DSH 插件 hooks 接管的正常形态）`)
   }
   else if (!lines.length) say(`  ✅ 守护在跑：pid ${lockAlive.pid}（锁心跳 ${lockAlive.ageSec}s，进程表查询没匹配到，以锁为准）`)
   for (const l of lines) {
@@ -179,7 +198,14 @@ say('══════ C2. DSH 侧插件：运行中的进程是否在跑当前
 // 而 A–G 全绿、doctor 22 项 0 失败、插件 selftest 全 PASS。自检绿 ≠ 用户在看的那个进程是新的。
 // 只提示、不计入退出码：「还没重启」不是仓库不一致，是运行态提醒（同 G 段的定位）。
 try {
-  const out2 = execSync('powershell -NoProfile -Command "Get-Process | Where-Object { $_.ProcessName -like \'*DeepSeek*\' } | ForEach-Object { $_.Id.ToString() + \'|\' + $_.StartTime.ToString(\'yyyy-MM-dd HH:mm:ss\') + \'|\' + $_.ProcessName }"', { encoding: 'utf8' })
+  // [红队第二轮 P3 修] 上一版「取最新启动」把**假红换成了假绿**：
+  //   hosts 来自 Get-Process 的**全部** *DeepSeek* 进程（实测 10 个），而我们的工具调用
+  //   每几秒就在 spawn 新的 dsh-subprocess —— 它们启动时间永远比插件改动新，
+  //   于是「宿主还在跑旧代码」这个真问题**再也不会报出来**。
+  //   按命令行动机过滤还不够（:02 实测仍剩 4 个）。真正的判据是**进程树**：
+  //   用户启动的宿主主进程，其父进程不是 DSH 自己（是 explorer.exe / 终端 / 计划任务）。
+  //   实测：59596(父=explorer) 01:49:47 才是宿主；02:14/02:15 那些都是它的孙子。
+  const out2 = execSync('powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like \'*DeepSeek*\' -and $_.CommandLine -notmatch \'--type=\' } | ForEach-Object { $_.ProcessId.ToString() + \'|\' + $_.CreationDate.ToString(\'yyyy-MM-dd HH:mm:ss\') + \'|\' + $_.Name + \'|\' + $_.ParentProcessId }"', { encoding: 'utf8' })
   const hostLines = out2.trim().split(/\r?\n/).filter(Boolean)
   if (!hostLines.length) { say("  ⚪ 没检测到 DSH 宿主进程（headless/未开 GUI）——跳过") }
   else {
@@ -203,18 +229,22 @@ try {
     //   长期假警告比没警告更糟：它训练人忽略这一行，真出事时也不会看。
     // 判据：用户重启后，**当前在跑的那个宿主**是最新起来的；旧进程要么已退出、
     //   要么是没被回收的残留，都不代表"用户现在看到的那份代码"。
-    const hosts = []
+    const all = []
     for (const l2 of hostLines) {
-      const [pid2, started2, pname2] = l2.trim().split("|")
+      const [pid2, started2, pname2, ppid2] = l2.trim().split("|")
       const st2 = new Date(String(started2).replace(" ", "T")).getTime()
-      if (Number.isFinite(st2)) hosts.push({ pid: pid2, start: st2, at: started2, name: pname2 })
+      if (Number.isFinite(st2)) all.push({ pid: pid2, start: st2, at: started2, name: pname2, ppid: ppid2 })
     }
+    // 根 = 父进程不在这批 DSH 进程里的那些（用户/explorer/终端拉起来的）
+    const pidSet = new Set(all.map((x) => x.pid))
+    const roots = all.filter((x) => !pidSet.has(x.ppid))
+    const hosts = roots.length ? roots : all
     if (hosts.length) {
       hosts.sort((a, b) => a.start - b.start)
-      const h0 = hosts[hosts.length - 1]          // 最新启动的那个 = 当前宿主
+      const h0 = hosts[hosts.length - 1]          // 最新启动的那个**根** = 当前宿主
       const oldest = hosts[0]
       const stale2 = Number.isFinite(newest) && newest > h0.start
-      say(`  ${stale2 ? "⚠️ " : "✅"} DSH 宿主最新启动于 ${h0.at}（${h0.name} pid ${h0.pid}；同名进程 ${hosts.length} 个，最早 ${oldest.at}）`)
+      say(`  ${stale2 ? "⚠️ " : "✅"} DSH 宿主启动于 ${h0.at}（${h0.name} pid ${h0.pid}；同名进程共 ${all.length} 个，其中根进程 ${roots.length} 个）`)
       const fmtLocal = (ms) => { const d = new Date(ms), p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` }
       say(`     插件最新改动：${fmtLocal(newest)}（${newestF}）`)
       if (stale2) say("     → 早于插件改动：**运行中的 DSH 可能仍在渲染旧版简报**；重启 DSH 后再核对 📋 看板 与 🗂 行")

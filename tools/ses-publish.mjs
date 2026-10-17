@@ -47,18 +47,27 @@ const SKIP_FRAGMENTS = [
 ];
 const SKIP_FILE_RE = /(\.log$|\.tgz$|\.zip$|\.sqlite(-wal|-shm)?$|\.bak-)/;
 
-function copyTree(src, dst, stats) {
+// [红队第二轮 P4 修] 面板**必须带 vendor**，否则发布出去是个响亮的坏包：
+//   面板 lib/index.js 硬依赖 vendor/dist/panel.js（内核 + 面板前端都在里面），
+//   而 SKIP_NAMES 有 'dist'、SKIP_FRAGMENTS 有 '/vendor/' ⇒ 两者都被剔掉。
+//   实测同规则模拟：面板 kept=8 skipped=2，发布后每条响应都带 coreError。
+//   所以给 copyTree 一个 keep 白名单（目前只有面板用）。
+function copyTree(src, dst, stats, keep) {
   if (!fs.existsSync(src)) return;
+  const keepName = new Set((keep && keep.names) || []);
+  const keepFrag = (keep && keep.fragments) || [];
   const walk = (s, d) => {
     const st = fs.statSync(s);
     if (st.isDirectory()) {
-      if (SKIP_NAMES.has(path.basename(s))) { stats.skipped++; return; }
+      const base = path.basename(s);
+      if (SKIP_NAMES.has(base) && !keepName.has(base)) { stats.skipped++; return; }
       fs.mkdirSync(d, { recursive: true });
       for (const e of fs.readdirSync(s)) walk(path.join(s, e), path.join(d, e));
       return;
     }
     const rel = '/' + path.relative(ROOT, s).replace(/\\/g, '/') + '/';
-    if (SKIP_FRAGMENTS.some((f) => rel.includes(f)) || SKIP_FILE_RE.test(s)) { stats.skipped++; return; }
+    const kept = keepFrag.some((f) => rel.includes(f));
+    if (!kept && (SKIP_FRAGMENTS.some((f) => rel.includes(f)) || SKIP_FILE_RE.test(s))) { stats.skipped++; return; }
     fs.mkdirSync(path.dirname(d), { recursive: true });
     fs.copyFileSync(s, d);
     stats.files++; stats.bytes += fs.statSync(d).size;
@@ -117,15 +126,22 @@ const PLANS = [
 // install.mjs 有 HERE 回退，所以这里必须把这几个 .mjs **平铺**复制进 codex-adapter。
 // 不加这一步的后果：下载包装完 hook 直接 ERR_MODULE_NOT_FOUND（ZCode 侧踩过一次的同型坑）。
 const CODEX_SHARED = ['brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs', 'engine.mjs'];
+// 面板是唯一需要 vendor 的包：vendor/ 里装着内核 dist 与面板前端构建产物，
+// 排除规则把它们剔掉就会得到一个"能装、但每条响应都报内核载入失败"的包。
+const KEEP_VENDOR = { names: new Set(['dist']), fragments: ['/vendor/'] };
 for (const [src, dst, desc] of PLANS) {
   const before = stats.files;
-  copyTree(path.join(ROOT, src), path.join(OUT, dst), stats);
+  const keep = dst === 'packages/dsh-panel' ? KEEP_VENDOR : null;
+  copyTree(path.join(ROOT, src), path.join(OUT, dst), stats, keep);
   ok(dst.padEnd(28) + (stats.files - before) + ' 个文件  ' + desc);
 }
 // 工具：只带"能重现这套东西"的那些，一次性探针不带（它们留在工作区）
 const TOOLS = [
   'ses-install.mjs', 'ses-rebuild.mjs', 'ses-pack-clients.mjs', 'check-versions.mjs', 'check-brief-filters.mjs',
   'ses-publish.mjs', 'ses-recall-probe.mjs', 'ses-purge-injected.mjs', 'ses-fix-message-count.mjs',
+  // [红队第二轮 P5] ses-pack-clients.mjs 打完包会打印「跑 node tools/ses-panel-install.mjs 安装」，
+  //   但发布 TOOLS 里没带它 ⇒ 拿到包的人照指引会 command not found。工具与指引必须一起发。
+  'ses-panel-install.mjs',
   '_mirror_dist.mjs', '_mirror_plugin.mjs', '_mirror_skills.mjs', '_probes-README.md',
 ];
 fs.mkdirSync(path.join(OUT, 'tools'), { recursive: true });
@@ -168,8 +184,14 @@ const CHECK = [
   'packages/dsh-plugin/index.js', 'packages/dsh-plugin/package.json',
   'packages/zcode-adapter/brief.mjs', 'packages/zcode-adapter/install.mjs',
   'packages/codex-adapter/brief.mjs', 'packages/codex-adapter/install.mjs',
+  // [红队第二轮 P4/P5] 面板此前**完全不在自检里** ⇒ 缺包/缺文件也全绿。
+  // 尤其 vendor/dist/panel.js 是硬依赖，缺了就是一个"响亮但不可用"的包。
+  'packages/dsh-panel/package.json', 'packages/dsh-panel/lib/index.js',
+  'packages/dsh-panel/vendor/dist/panel.js',
   'skills/handoff-atlas/SKILL.md', 'skills/handoff-atlas/scripts/anchor_audit.mjs',
   'tools/ses-install.mjs', 'tools/check-versions.mjs',
+  // 指引里让用户跑它，就得一起发（否则照指引执行会找不到命令）
+  'tools/ses-panel-install.mjs',
 ];
 for (const c of CHECK) {
   if (fs.existsSync(path.join(OUT, c))) ok(c); else bad('发布树缺文件: ' + c);

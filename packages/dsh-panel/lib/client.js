@@ -1047,19 +1047,30 @@ window.__ModuleLoader__.load({
         const bridges = [];
         if (mainRoot !== null) {
           const mainSet = groups.get(mainRoot);
+          // [红队第二轮 P8 修] 去重：孤立点原本被**两个**循环各桥一次
+          //   （分量循环给 w=0.25，零度循环又给 w=0.18）⇒ 双倍拉力 + 两条重叠虚线，
+          //   与注释「每个游离分量只桥一条」自相矛盾。用一张 key 表保证一对端点只出现一次。
+          const seen = new Set();
+          const addBridge = (from, to, w) => {
+            if (from < 0 || to < 0 || from === to) return;
+            const k = Math.min(from, to) + '-' + Math.max(from, to);
+            if (seen.has(k)) return;
+            seen.add(k);
+            bridges.push({ a: from, b: to, w });
+          };
           for (const [r, g] of groups) {
             if (r === mainRoot) continue;
             // 每个游离分量只桥**一条**：桥多了会把小团整个吸平，反而没有"游离感"
-            const from = near(g[0], g) >= 0 ? near(mainSet[0], g) : g[0];
+            // 取分量里离主体最近的那个点作代表（单点分量就是它自己）
+            const from = g.length === 1 ? g[0] : near(mainSet[0], g);
             const to = near(from, mainSet);
-            if (from >= 0 && to >= 0) bridges.push({ a: from, b: to, w: 0.25 });
+            addBridge(from, to, 0.25);
           }
-          // 零度节点（完全没边的）也要牵一下，否则它们在边缘乱飘
-          const all = N.map((_, i) => i);
+          // 零度节点（完全没边的）也要牵一下，否则它们在边缘乱飘。
+          // 上面那条循环已经把单点分量的孤立点桥过了，这里只兜**没有主体可桥**的极端情况。
           for (let i = 0; i < N.length; i++) {
             if (deg[i] !== 0) continue;
-            const to = near(i, mainSet.length ? mainSet : all);
-            if (to >= 0) bridges.push({ a: i, b: to, w: 0.18 });
+            addBridge(i, near(i, mainSet), 0.18);
           }
         }
         // deg / 标签集在**建图时**算好一次（不每帧排序）
@@ -1067,7 +1078,8 @@ window.__ModuleLoader__.load({
         const labSet = new Set(N.map((x, i) => ({ i, s: x.sessions || 0 }))
           .sort((a, b) => b.s - a.s).slice(0, 22).map((x) => x.i));
         simRef.current = { nodes: N, links: L, bridges, deg, labSet, maxS2init, heat: 1 };
-        return () => { simRef.current = null; };
+        // 重建 sim 时必须清拖拽状态：否则 dragRef 指着**已经不在新图里**的节点对象
+        return () => { simRef.current = null; dragRef.current = null; };
       }, [nodes, links, size.w, size.h]);
 
       // hover 走 ref：放进绘制依赖会让每次悬停都重启 RAF（画面会一顿一顿的）
@@ -1174,8 +1186,14 @@ window.__ModuleLoader__.load({
           // ── 绘制 ──
           ctx.clearRect(0, 0, size.w, size.h);
 
-          const drawEdge = (a, b, w, dashed, alphaBoost, hot) => {
-            const curv = curveOf(a === b ? 0 : Math.min(a, b), Math.max(a, b));
+          // [红队第二轮 P6 修] 曲率算的是**下标**，不是节点对象 ——
+          //   原写法 curveOf(Math.min(a,b), Math.max(a,b)) 传的是两个节点对象，
+          //   Math.min(obj) = NaN → 位运算把 NaN 归成 0 → curv 恒为同一个值，
+          //   于是"每条边曲率不同"这件事**从未发生**（实测三条边曲率全是 -0.17）。
+          //   现在由调用方传下标进来。
+          const drawEdge = (a, b, ia, ib) => {
+            const lo = Math.min(ia, ib), hi = Math.max(ia, ib);
+            const curv = Number.isFinite(lo) && Number.isFinite(hi) ? curveOf(lo, hi) : 0;
             const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
             const dx = b.x - a.x, dy = b.y - a.y;
             const px = -dy * curv * 0.5, py = dx * curv * 0.5;
@@ -1196,7 +1214,7 @@ window.__ModuleLoader__.load({
               const hot = hoverIdx !== null && (hoverIdx === br.a || hoverIdx === br.b);
               ctx.globalAlpha = hot ? 0.5 : 0.10;
               ctx.lineWidth = hot ? 1.3 : 0.7;
-              drawEdge(A, B, br.w, true, 1, hot);
+              drawEdge(A, B, br.a, br.b);
             }
             ctx.restore();
             ctx.globalAlpha = 1;
@@ -1212,7 +1230,7 @@ window.__ModuleLoader__.load({
             ctx.strokeStyle = hot ? accent : muted;
             ctx.globalAlpha = hot ? 0.6 : 0.07 + t * 0.24;
             ctx.lineWidth = hot ? 1.7 : 0.5 + t * 1.2;
-            drawEdge(A, B, l.w, false, 1, hot);
+            drawEdge(A, B, l.a, l.b);
           }
           ctx.globalAlpha = 1;
 
@@ -1285,19 +1303,22 @@ window.__ModuleLoader__.load({
         if (!sim) return;
         const d = dragRef.current;
         if (d) {
-          // 拖拽中：直接钉住，并记录瞬时速度（松手时甩出去 → 回弹）
-          const hit = hitAt(e.clientX, e.clientY);
           const cv = canvasRef.current;
           if (!cv) return;
           const rect = cv.getBoundingClientRect();
           const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-          const p = sim.nodes[d.i];
-          if (!p) return;
+          const p = d.node;                                    // 对象引用，不用下标（sim 重建后下标会指错人）
+          if (!p || !sim.nodes.includes(p)) { dragRef.current = null; setDragging(false); return; }
           const now = performance.now();
           const dt = Math.max(8, now - d.t);
-          d.vx = (mx - p.x) / dt * 16;
-          d.vy = (my - p.y) / dt * 16;
-          d.t = now;
+          // ⚠️ [1021 修「拖拽时张牙舞爪疯狂乱跳」]
+          //   原写法 d.vx = (mx - p.x)/dt*16 —— 而 p.x 正是被鼠标**钉住**的位置，
+          //   于是 (mx - p.x) 恒等于常量 -d.dx。拿常量除以每帧变化的 dt，
+          //   "速度"每帧符号乱翻；松手时又把它当抛掷速度 → 节点被甩得满屏乱窜。
+          //   正确口径：速度 = **鼠标这一帧移动了多远 / 这一帧多久**。
+          d.vx = ((mx - d.lx) / dt) * 16;
+          d.vy = ((my - d.ly) / dt) * 16;
+          d.lx = mx; d.ly = my; d.t = now;
           p.x = mx + d.dx; p.y = my + d.dy;
           p.vx = 0; p.vy = 0;
           return;
@@ -1312,7 +1333,12 @@ window.__ModuleLoader__.load({
         const hit = hitAt(e.clientX, e.clientY);
         if (!hit) return;
         const p = sim.nodes[hit.i];
-        dragRef.current = { i: hit.i, dx: p.x - hit.mx, dy: p.y - hit.my, vx: 0, vy: 0, t: performance.now() };
+        dragRef.current = {
+          node: p,                                       // 对象引用（不是下标）
+          dx: p.x - hit.mx, dy: p.y - hit.my,            // 抓住时的手-点偏移，保证按下不"跳一下"
+          lx: hit.mx, ly: hit.my,                        // 上一帧鼠标位置（算速度用）
+          vx: 0, vy: 0, t: performance.now(),
+        };
         p.fixed = true;                       // 钉住：松手前不动
         sim.heat = Math.max(sim.heat, 0.9);   // 唤醒，邻居会跟着让位
         setDragging(true);
@@ -1324,7 +1350,7 @@ window.__ModuleLoader__.load({
         dragRef.current = null;
         setDragging(false);
         if (!sim || !d) return;
-        const p = sim.nodes[d.i];
+        const p = d.node;
         if (!p) return;
         p.fixed = false;
         // 甩出去：把拖拽末速度交给节点，配合 0.90 阻尼会"弹"回去而不是"吸"回去
