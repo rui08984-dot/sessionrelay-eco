@@ -128,7 +128,34 @@ const lockAlive = (() => {
 try {
   const out = execSync('powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'node.exe\'\\" | Where-Object { $_.CommandLine -like \'*srelay.js*watch*\' } | ForEach-Object { $_.ProcessId.ToString() + \'|\' + $_.CreationDate.ToString(\'yyyy-MM-dd HH:mm:ss\') }"', { encoding: 'utf8' })
   const lines = out.trim().split('\n').filter(Boolean)
-  if (!lines.length && !lockAlive.ok) { problems++; say('  🔴 没有守护进程在跑（采集停摆）') }
+  // ── [1021 二次修] 加**第三个信号：真实采集结果** ──
+  //
+  // 病历（刚现场撞到的）：DSH 插件修好 hooks 之后，#17 那条路真的开始采集了 ——
+  //   于是本机出现「没有 srelay watch 进程、项目锁心跳也冻着，但消息在正常入库」的形态，
+  //   C 段照样报「采集停摆」🔴。这已是同一类病的第 5 次：
+  //   **判据（有没有那个进程）没覆盖被判断的对象（采集有没有在工作）**。
+  //   我们要的答案是"记忆有没有在进"，不是"有没有一个叫 watch 的进程"。
+  // 判据：近 30 分钟内有过入库 ⇒ 采集活着，不管是谁干的（独立守护 / 宿主内 hooks / serve 侧同步）。
+  const recentIngest = (() => {
+    try {
+      const dbPath = path.join(process.cwd(), '.sessionrelay', 'relay.sqlite')
+      if (!fs.existsSync(dbPath)) return null
+      const { DatabaseSync } = require('node:sqlite')
+      const db = new DatabaseSync(dbPath, { readOnly: true })
+      try {
+        const row = db.prepare('SELECT MAX(created_at) AS m FROM messages').get()
+        const t = row && row.m ? Date.parse(String(row.m)) : NaN
+        if (!Number.isFinite(t)) return null
+        return { agoMin: Math.round((Date.now() - t) / 60000) }
+      } finally { try { db.close() } catch { /* 已关 */ } }
+    } catch { return null }
+  })()
+  const ingestAlive = !!(recentIngest && recentIngest.agoMin <= 30)
+  if (!lines.length && !lockAlive.ok && !ingestAlive) {
+    problems++; say('  🔴 采集没有在跑（进程表、锁心跳、近 30 分钟入库 —— 三者都没有）')
+  } else if (!lines.length && !lockAlive.ok && ingestAlive) {
+    say(`  ✅ 采集在跑：宿主内采集（近 ${recentIngest.agoMin} 分钟有入库；无独立 watch 进程、锁心跳不动 —— DSH 插件 hooks 接管的正常形态）`)
+  }
   else if (!lines.length) say(`  ✅ 守护在跑：pid ${lockAlive.pid}（锁心跳 ${lockAlive.ageSec}s，进程表查询没匹配到，以锁为准）`)
   for (const l of lines) {
     const [pid, created] = l.trim().split('|')
@@ -170,8 +197,12 @@ try {
     for (const d2 of plugDirs) for (const f2 of PLUGIN_FILES) {
       try { const m2 = fs.statSync(path.join(d2, f2)).mtimeMs; if (m2 > newest) { newest = m2; newestF = f2 } } catch { /* 缺文件由 B/E 段报 */ }
     }
-    // 只报**最早**启动的那个：Electron 主进程先起、渲染/GPU 子进程紧随其后，
-    // 逐个列出来会刷 10 行噪声（实测 10 个同名进程），而只需要知道"宿主是什么时候起的"。
+    // [1021 修] 取**最新**启动的那个，不是最早的。
+    // 病历：原来取最早 ⇒ 只要机器上留着一个上上个世代的僵留进程，就会永远报
+    //   「宿主启动早于插件改动，可能仍在跑旧版」——**用户明明重启过了也照样警告**。
+    //   长期假警告比没警告更糟：它训练人忽略这一行，真出事时也不会看。
+    // 判据：用户重启后，**当前在跑的那个宿主**是最新起来的；旧进程要么已退出、
+    //   要么是没被回收的残留，都不代表"用户现在看到的那份代码"。
     const hosts = []
     for (const l2 of hostLines) {
       const [pid2, started2, pname2] = l2.trim().split("|")
@@ -180,9 +211,10 @@ try {
     }
     if (hosts.length) {
       hosts.sort((a, b) => a.start - b.start)
-      const h0 = hosts[0]
+      const h0 = hosts[hosts.length - 1]          // 最新启动的那个 = 当前宿主
+      const oldest = hosts[0]
       const stale2 = Number.isFinite(newest) && newest > h0.start
-      say(`  ${stale2 ? "⚠️ " : "✅"} DSH 宿主最早启动于 ${h0.at}（${h0.name} pid ${h0.pid}；同名进程 ${hosts.length} 个）`)
+      say(`  ${stale2 ? "⚠️ " : "✅"} DSH 宿主最新启动于 ${h0.at}（${h0.name} pid ${h0.pid}；同名进程 ${hosts.length} 个，最早 ${oldest.at}）`)
       const fmtLocal = (ms) => { const d = new Date(ms), p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` }
       say(`     插件最新改动：${fmtLocal(newest)}（${newestF}）`)
       if (stale2) say("     → 早于插件改动：**运行中的 DSH 可能仍在渲染旧版简报**；重启 DSH 后再核对 📋 看板 与 🗂 行")
