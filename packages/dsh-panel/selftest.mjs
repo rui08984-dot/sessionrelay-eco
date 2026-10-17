@@ -217,6 +217,59 @@ if (groupDefMatch) {
 const missingPrefixes = corePrefixes.filter((p) => !clientKnobPrefixes.includes(p));
 ok('客户端旋钮分组定义完整覆盖核心全部 8 组前缀（防遗漏 compress）',
   missingPrefixes.length === 0, '缺失前缀: ' + missingPrefixes.join(', '));
+// ── 经验层展示口径：范围 + 待复核（[1021] 新增维度）──
+// 为什么把客户端代码抠出来跑：这两个维度是**纯展示判据**，后端只是把字段送过来，
+// 一旦面板把它们写错（比如把 scope 当领域显示、把 needs_review 读成顶层计数），
+// 用户看到的就是"信号不存在"。抠出来 new Function 跑，比只看字符串存在强。
+const scopeBlockStart = clientSrc.indexOf('// ─────────────────── 经验条目的展示口径（唯一一份） ───────────────────');
+const scopeBlockEnd = clientSrc.indexOf('// ─────────────────────────── 视图 2：经验（Lessons） ───────────────────────────');
+let lessonUi = null, lessonUiErr = null;
+if (scopeBlockStart < 0 || scopeBlockEnd <= scopeBlockStart) lessonUiErr = '找不到「经验条目的展示口径」代码块标记';
+else {
+  try {
+    const block = clientSrc.slice(scopeBlockStart, scopeBlockEnd);
+    lessonUi = new Function('return (function(){' + block + '\n return { LESSON_SCOPE_LABELS, lessonScopeLabel, lessonNeedsReview, lessonReviewCount }; })();')();
+  } catch (e) { lessonUiErr = String(e && e.message || e); }
+}
+const scopeCases = lessonUi ? [
+  ['global', { scope: 'global' }],
+  ['domain(带领域名)', { scope: 'domain', domain: 'writing' }],
+  ['domain(缺领域名)', { scope: 'domain' }],
+  ['project', { scope: 'project' }],
+  ['缺字段降级', {}],
+] : [];
+const scopeGot = lessonUi ? scopeCases.map((c) => lessonUi.lessonScopeLabel(c[1])) : [];
+ok('范围口径：global=全局 / domain=领域名 / project=当前项目（缺字段降级成「—」）',
+  !!lessonUi && JSON.stringify(scopeGot) === JSON.stringify(['全局', '领域: writing', '领域', '当前项目', '—']),
+  lessonUiErr || JSON.stringify(scopeGot));
+ok('待复核判据认 needsReview 与 needs_review=1（两种写法都算）',
+  !!lessonUi && lessonUi.lessonNeedsReview({ needsReview: true }) === true
+    && lessonUi.lessonNeedsReview({ needs_review: 1 }) === true
+    && lessonUi.lessonNeedsReview({ needsReview: false }) === false
+    && lessonUi.lessonReviewCount([{ needsReview: true }, {}, { needs_review: 1 }]) === 2,
+  lessonUiErr || '');
+ok('经验条目上真的渲染了「范围」与「⚠ 待复核」标记',
+  clientSrc.includes("'范围: ' + lessonScopeLabel(item)") && clientSrc.includes("lessonNeedsReview(item) ? h('span'") && clientSrc.includes('⚠ 待复核'));
+ok('待复核计数不再读不存在的顶层字段（曾经显示成 (undefined)）',
+  !/data\s*\?\s*data\.needsReview/.test(clientSrc) && clientSrc.includes("'待复核 (' + reviewCount + ')'"));
+// harvest 阶段：面板是数据驱动渲染 lc.stages 的（没有硬编码阶段清单），内核 STAGES 里有就会显示。
+// 这里把两件事都钉住：① 客户端不写死清单；② 真数据里确实含 harvest 且紧邻 consolidate。
+ok('生命周期是数据驱动（无硬编码阶段清单，内核加阶段面板自动显示）',
+  clientSrc.includes('(lc.stages || []).map(') && !/\[\s*'guard'\s*,/.test(clientSrc));
+try {
+  const lcNow = corePanel.panelLifecycle();
+  const ids = (lcNow.stages || []).map((s) => s.id);
+  if (lcNow.ok) {
+    const hi = ids.indexOf('harvest'), ci = ids.indexOf('consolidate');
+    ok('生命周期阶段含 harvest（经验采集 6h）且与 consolidate 相邻',
+      hi >= 0 && ci >= 0 && ci === hi + 1, 'stages=' + ids.join(','));
+  } else {
+    console.log('  ⓘ 全局库不可读，跳过 harvest 阶段断言：' + lcNow.error);
+  }
+} catch (e) {
+  console.log('  ⓘ 生命周期读取异常，跳过 harvest 阶段断言：' + String(e && e.message || e).slice(0, 80));
+}
+
 const pkg = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8'));
 ok('清单声明 dsh.client.platform = web（DSH 加载客户端半的约定）', !!(pkg.dsh && pkg.dsh.client && pkg.dsh.client.platform === 'web'));
 ok('导出 ./client 且文件存在', !!(pkg.exports && pkg.exports['./client']) && fs.existsSync(path.join(HERE, pkg.exports['./client'].replace(/^\.\//, ''))));

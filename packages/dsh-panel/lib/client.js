@@ -619,6 +619,9 @@ window.__ModuleLoader__.load({
       const projects = (data && data.projects) || [];
       const errors = (data && data.errors) || [];
       const semantic = (data && data.semantic) || {};
+      // 经验摘要里的「待复核」：接口给 items 就按 items 算（顶层没有这个计数字段）
+      const lessonsSummary = (data && data.lessons) || {};
+      const reviewTotal = lessonReviewCount(lessonsSummary.items);
 
       const maxSessions = Math.max(1, ...projects.map((p) => p.sessions || 0));
       const filteredProjects = projects.filter((p) => {
@@ -657,7 +660,14 @@ window.__ModuleLoader__.load({
             icon: 'alert',
           }),
           h(HudCard, { label: '04 / 已归档正文', value: n(t.archived), hint: '已清理原始正文，保留结论', icon: 'layers' }),
-          h(HudCard, { label: '05 / 可注入经验', value: n(data && data.lessons ? data.lessons.injectable : 0), hint: '可供新对话调用的经验', accent: 'var(--sr-accent)', icon: 'brain' }),
+          h(HudCard, {
+            label: '05 / 可注入经验',
+            value: n(lessonsSummary.injectable),
+            hint: '可供新对话调用的经验' + (reviewTotal > 0 ? ' · ⚠ 待复核 ' + n(reviewTotal) + ' 条' : ''),
+            title: reviewTotal > 0 ? '经验池里有 ' + reviewTotal + ' 条被系统标成"待复核"（needs_review=1）：去「经验」页按"待复核"筛选' : undefined,
+            accent: 'var(--sr-accent)',
+            icon: 'brain',
+          }),
           h(HudCard, { label: '06 / 存储物理占用', value: mb(t.dbBytes), hint: '包含索引与缓存文件' })
         ),
 
@@ -801,6 +811,34 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ─────────────────── 经验条目的展示口径（唯一一份） ───────────────────
+    // [1021] 经验层新增两个维度，面板必须显示出来，否则用户看不到"这条经验能共享给谁、
+    //        系统是不是在对它表示不确定"：
+    //   · 范围 scope：global=全局 / domain=领域名（同领域项目共享）/ project=当前项目
+    //     —— 数据来自核心 panelLessons 的 item.scope；domain 时把领域名一起显示。
+    //   · 待复核 needs_review=1：系统说"我不确定，你来看"。接口早就在给 item.needsReview，
+    //     但界面只把它当成筛选项里的一个计数，而那个计数读的是顶层 data.needsReview
+    //     —— 接口根本没有这个字段 ⇒ 下拉显示"待复核 (undefined)"，信号等于不存在。
+    //     现在：计数从 items 自己算，条目标记直接跟 item.needsReview 走。
+    // 缺字段一律安全降级（显示「—」）：核心是 Lead 那边同时在改的，面板不许假设字段一定在。
+    const LESSON_SCOPE_LABELS = { global: '全局', domain: '领域', project: '当前项目' };
+    function lessonScopeLabel(item) {
+      const scope = String((item && item.scope) || '').trim().toLowerCase();
+      if (!scope) return '—';                                  // 老内核没给 scope
+      if (scope === 'domain') {
+        const dn = String((item && item.domain) || '').trim();
+        return dn ? (LESSON_SCOPE_LABELS.domain + ': ' + dn) : LESSON_SCOPE_LABELS.domain;
+      }
+      return LESSON_SCOPE_LABELS[scope] || scope;              // 未知取值显示原值，不吞信息
+    }
+    function lessonNeedsReview(item) {
+      if (!item) return false;
+      return item.needsReview === true || item.needs_review === 1 || item.needs_review === true;
+    }
+    function lessonReviewCount(items) {
+      return (items || []).filter(lessonNeedsReview).length;
+    }
+
     // ─────────────────────────── 视图 2：经验（Lessons） ───────────────────────────
     function LessonsView(props) {
       const { data, error, loading, refresh } = props.api;
@@ -826,10 +864,16 @@ window.__ModuleLoader__.load({
       const threshold = data ? data.threshold : 0;
       const byStatus = (data && data.byStatus) || {};
       const byGrade = (data && data.byGrade) || {};
+      const byScope = (data && data.byScope) || {};
+      const reviewCount = lessonReviewCount(items);
+      // 范围计数优先用接口给的 byScope（全量口径），接口没给就按已加载条目数
+      const scopeCount = (k) => (typeof byScope[k] === 'number'
+        ? byScope[k]
+        : items.filter((i) => String((i && i.scope) || '').toLowerCase() === k).length);
 
       const filtered = items.filter((item) => {
         if (statusFilter === 'injectable' && !item.injectable) return false;
-        if (statusFilter === 'review' && !item.needsReview) return false;
+        if (statusFilter === 'review' && !lessonNeedsReview(item)) return false;
         if (statusFilter !== 'all' && statusFilter !== 'injectable' && statusFilter !== 'review' && item.status !== statusFilter) return false;
         if (gradeFilter !== 'all' && item.grade !== gradeFilter) return false;
         if (filter.trim()) {
@@ -856,6 +900,13 @@ window.__ModuleLoader__.load({
           ),
           h('div', { style: { height: 6, background: 'var(--sr-border-subtle)', overflow: 'hidden' } },
             h('div', { style: { height: '100%', width: pct(admissionRate), background: 'var(--sr-text)' } })
+          ),
+          // 共享范围分布 + 待复核总览（同一份数据，不额外发请求）
+          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', fontSize: 12, marginTop: 10, color: 'var(--sr-text-muted)' } },
+            h('span', null, '范围：' + ['global', 'domain', 'project']
+              .map((k) => LESSON_SCOPE_LABELS[k] + ' ' + n(scopeCount(k))).join(' · ')),
+            h('span', { style: reviewCount > 0 ? { color: 'var(--sr-warn)', fontWeight: 800 } : null },
+              '待复核：' + n(reviewCount) + ' 条')
           )
         ),
 
@@ -881,7 +932,8 @@ window.__ModuleLoader__.load({
             },
               h('option', { value: 'all' }, '全部状态 (' + total + ')'),
               h('option', { value: 'injectable' }, '可注入 (' + injectable + ')'),
-              h('option', { value: 'review' }, '待复核 (' + (data ? data.needsReview : 0) + ')'),
+              // [1021] 计数从 items 算：顶层 data.needsReview 接口从来没给过（原来显示 "(undefined)"）
+              h('option', { value: 'review' }, '待复核 (' + reviewCount + ')'),
               Object.keys(byStatus).map((st) => h('option', { key: st, value: st }, st + ' (' + byStatus[st] + ')'))
             ),
             h('select', {
@@ -927,9 +979,16 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'srelay-badge ' + (item.injectable ? 'srelay-badge-active' : '') },
                     item.injectable ? '● 可注入' : '○ 仅存档'
                   ),
-                  item.needsReview ? h('span', { className: 'srelay-badge', style: { borderColor: 'var(--sr-warn)', color: 'var(--sr-warn)' } }, '待复核') : null,
+                  lessonNeedsReview(item) ? h('span', {
+                    className: 'srelay-badge',
+                    style: { borderColor: 'var(--sr-warn)', color: 'var(--sr-warn)', fontWeight: 800 },
+                    title: '系统对这条经验不确定（needs_review=1）：值得你确认是留下还是退休',
+                  }, '⚠ 待复核') : null,
+                  h('span', { style: { fontWeight: 700 } }, '范围: ' + lessonScopeLabel(item)),
+                  // 领域名另起一格（范围=领域时已包含它，不重复显示）
+                  item.domain && String((item.scope || '')).toLowerCase() !== 'domain'
+                    ? h('span', null, '领域: ' + item.domain) : null,
                   h('span', null, '定级: ' + item.grade),
-                  h('span', null, '领域: ' + (item.domain || item.scope || '通用')),
                   h('span', null, '活力分: ' + item.live),
                   h('span', null, '命中: ' + item.hits + ' / 采纳: ' + item.uses),
                   h('span', null, '建于 ' + item.createdAt.slice(0, 10))
@@ -2407,6 +2466,7 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: { marginTop: 14, fontWeight: 700, fontSize: 12, fontFamily: 'var(--sr-font-sans)' } },
           '可注入经验：' + n(lessons.injectable) + ' 条'
+            + (lessonReviewCount(lessons.items) > 0 ? ' · ⚠ 待复核 ' + n(lessonReviewCount(lessons.items)) + ' 条' : '')
         ),
         h('div', { style: { marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 } },
           (data && data.projects ? data.projects.slice(0, 5) : []).map((p) => h('div', {
