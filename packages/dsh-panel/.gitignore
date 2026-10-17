@@ -1,0 +1,3 @@
+# vendor/dist 是构建产物：由 tools/ses-panel-install.mjs 从 core/SessionRelay/dist 同步
+# （内核 dist 583KB、零 npm 依赖 —— 面板插件不 vendor node_modules）
+vendor/

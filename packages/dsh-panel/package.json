@@ -1,0 +1,32 @@
+{
+  "name": "dsh-srelay-panel",
+  "version": "0.1.0",
+  "description": "SessionRelay 记忆台：DSH 原生面板（左栏入口 + 主面板），只读浏览各项目记忆库，可改配置、可跑白名单动作。数据来自内核 dist/panel.js，插件本身零 npm 依赖。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "vendor",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  },
+  "license": "MIT"
+}

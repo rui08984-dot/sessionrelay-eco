@@ -105,6 +105,10 @@ const PLANS = [
   // [1021] Codex 适配器：与 ZCode 共用 brief-shared 同一份简报逻辑，只是配置面与 trust 步骤不同。
   //   发布树必须带它 —— 否则别人永远拿不到第三端（和当初面板的"本机能跑、别人拿不到"同型盲区）。
   ['integrations/codex', 'packages/codex-adapter', 'Codex 适配器（SessionStart 简报 + MCP + 技能）'],
+  // [1021] 面板也纳进来：此前它只以 dsh-panel-*.zip 发在 Release，**源码不进仓库** ⇒
+  //   想看/改它的人无从下手，而且与其它三端不对称（三端都有 packages/，面板没有）。
+  //   面板零 npm 依赖（纯 Canvas + React 来自宿主），整目录搬过去即可。
+  ['integrations/dsh-srelay-panel', 'packages/dsh-panel', 'DSH 记忆台面板（图谱/看板/经验/旋钮）'],
   ['integrations/skills/handoff-atlas', 'skills/handoff-atlas', '交接与全资源地图技能'],
 ];
 

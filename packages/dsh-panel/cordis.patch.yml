@@ -1,0 +1,6 @@
+# dsh-srelay-panel 挂载层：把面板本体加进 profile 的插件栈
+# 形状与 dsh-reach / dsh-searxng-tool / dsh-srelay-brief 一致 —— 新实例必须用 insert，
+# 裸写 id 会被当成覆盖并报 entry not found。
+- insert:
+    - id: dsh-srelay-panel
+      name: 'dsh-srelay-panel'
