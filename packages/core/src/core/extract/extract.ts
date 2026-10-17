@@ -8,13 +8,17 @@ export interface Msg {
   content: string;
   seqNum: number;
   createdAt?: string | null;
+  /** 消息的稳定主键。**1020 新增**：`seqNum` 是位置索引，消息被裁剪后整体前移 ⇒
+   *  按 seq 回查会指到**错的那条**（dsh-memory-kit 把这个叫「序号漂移」，是他们的头号坑）。
+   *  实测我们 857 条决策里 525 条（61%）按 seq 定位不到。id 是稳定的，用它回查才对。 */
+  id?: string;
 }
 
 export interface ExtractedMeta {
   files: string[];
   topics: string[];
-  decisions: Array<{ text: string; seq: number; at?: string; kind?: 'decision' | 'negative' }>;
-  questions: Array<{ q: string; seq: number; at?: string; unresolved: boolean }>;
+  decisions: Array<{ text: string; seq: number; msgId?: string; at?: string; kind?: 'decision' | 'negative' }>;
+  questions: Array<{ q: string; seq: number; msgId?: string; at?: string; unresolved: boolean }>;
   codeBlockCount: number;
   keyExchanges: Array<{ userText: string; aiText: string; userSeq: number; reason: string }>;
 }
@@ -297,7 +301,90 @@ function plausibleDecision(text: string): boolean {
   // [fork 1015] 内嵌 JSON 残片：原守卫只认 confirmed/title/session_id 三个键名，
   // 实测漏了 `"done": true`、`"evidence": "..."` 这类（Phase 3 修复B 顺带扩族）
   if (/"[A-Za-z_]\w*"\s*:/.test(t)) return false;
+  // [1020] 决策动词后**紧跟逗号**=从句子中段截出的残片。
+  //   形状：原句是「…所以选择，xxx」这种带语境的句子，提取器只截到动词+逗号，
+  //   于是产出「决定，因为两条路的工作量差一个数量级」「选择，17 t/s 是真实天花板」这类。
+  //   实测 agent1super 库 864 条里命中 **19 条，逐条看过 19/19 全是垃圾**（零误伤）。
+  //   注意这条是**抽取端**判据（不进库），与简报端第 9~11 条互补：那条管已入库的，这条不产生。
+  if (/^(决定|改用|换成|采用|选择|调整为|修改为)[，,]/.test(t)) return false;
+  // [v24 · 1021] 「决策动词 + 明确对象」，且必须是**陈述**——见 decisionShapeVeto 上方长注释。
+  if (decisionShapeVeto(t) !== null) return false;
   return true;
+}
+
+// ── [v24 · 1021] 决策的「形状」判据：v23 之后仍在库里的垃圾，一半是同一种病 ──
+//
+// 病历（agent1super 库 863 条决策逐条读）：v23 修掉「动词后紧跟逗号」之后，剩下的垃圾里
+// **最多的一类是「决定」被当成谓语动词「取决于」用**，它的宾语是一个**开放议题**——
+// 整句没有拍下任何结论，只说了"取决于什么"：
+//   · 决定方案走向的问题            ← 名词短语，连谓语都没有（原本就是简报里的垃圾样本）
+//   · 决定本地链的最终命运 / 决定后面所有优化的方向 / 决定整个电台的音质标准
+//   · 决定能不能静默安装 / 决定值不值得引入 / 决定重试还是换 npm 装 / 决定装不装
+//   · 决定从哪条续起 / 决定子代理的模型/工具配置 / 决定已归档记忆（碎片）
+// 这类句子的主语是**别的东西**（某个因素），不是做决定的人。它回答的是"取决于什么"，
+// 不是"定了什么"。所以判据不该问"有没有决策动词"，要问**「有没有明确对象 + 是不是陈述」**。
+//
+// 七条判据。每一条都在 agent1super 全部决策上量过、命中的**逐条人工判读过**（数字见 version.ts）：
+//   ① 决定 + 疑问/取舍谓语 → 议题（"取决于"），不是结论。
+//   ② 决定 + 抽象话题名词结尾 → 议题。⚠️ 必须放过「决定采用 X 方案」这类**有变更动词**的
+//      真决策，故加负向预查。
+//   ③ 决定 + 裸名词短语（≤10 字且无谓语标记）→ 碎片（"决定已归档记忆""决定的甜点值"）。
+//      ⚠️ 刻意放过含谓语标记的短句（"决定还是等你""决定烙进权重""决定：不再干等"都是真决策）。
+//   ④ 报告残渣：[completed] / [pending] 勾选框；或"上一条3. 下一条"粘连（前一条决策被
+//      TodoWrite 列表行粘上来，整条已不是决策）。粘连判据要求**数字前是非空白**，
+//      这样句首的 "1. xxx" 不误杀。
+//   ⑤ 问句结尾（吗 / ？）——用户问的"要不要…吗"是提问，不是拍板。
+//   ⑥ 自引用回显：含 ← / 旧: / 整行剥掉。病历是**简报被粘回消息**，于是"判据说明"
+//      连同被举反例的垃圾一起入库（"决定要不要另下 Launcher ← 问句，不是决策"）。
+//   ⑦ 名词短语化结尾（的问题 / 时很关键 / 的答案）；"决定权"是名词（同 v18 的"选择器"族）。
+//
+// 为什么不用模型：卖点是零模型。为什么不用分词：中文无词边界，分词器换一版判据就漂一版，
+// 而这里要的只是**形状**——闭集关键词 + 长度 + 结尾形态，已经能把这七类全分开。
+/** ① 决定 + 疑问/取舍谓语 = 「取决于」，宾语是待定议题。取模态词表而不是开放疑问词：
+ *  「哪/谁/怎么」会把真决策「决定"写哪个库"——绑定必须两段式」误杀（test/unit/extract.spec.ts:290 夹具）。 */
+const DECISION_OPEN_TOPIC = /^决定了?[^。！？!?\n]{0,10}(?:能不能|能不能够|能否|是否|要不要|是不是|会不会|该不该|值不值得|灵不灵|通不通|有没有|多深|多久|多少|什么|何时|哪些|为什么)/;
+/** ① 附：A不A 式正反问（决定装不装 / 决定改没改）。限定在动词后 6 字内——句尾出现的
+ *  "够不够用"是陈述的一部分（"顺便看看本地模型的水平够不够用"是真决策），不能连带杀掉。 */
+const DECISION_A_NOT_A = /^决定了?[^。！？!?\n]{0,6}(.)[不没]\1/;
+/** ② 决定 + …还是… = 把选项摆出来给人挑，没有拍板。⚠️ 排除"还是"紧跟动词的副词用法
+ *  （"决定还是等你"是拍板，不是选择题）。 */
+const DECISION_CHOICE_OPEN = /^决定了?.{1,20}还是[^？?]/;
+/** ③ 抽象话题名词结尾。负向预查放行带变更动词的（"决定采用 Vite 方案"是真决策）。 */
+const DECISION_TOPIC_TAIL = /^决定了?(?![^。！？!?\n]*(?:改用|换成|采用|选择|迁移|切换到|升级到|接入|放弃|弃用|保留|沿用))[^。！？!?\n]{1,14}(?:方向|策略|方式|方案|问题|清单|概率|命运|因素|标准|可行性|流畅度|走向|设计|架构|配置|形态)$/;
+/** ④ 报告残渣：TodoWrite / markdown 勾选框被一起截进来了 */
+const DECISION_REPORT_RESIDUE = /\[\s*(?:completed|pending|in_progress|done|todo)\s*\]|\[\s*[ x]\s*\]/i;
+/** ④ 附：粘在中文/标点后面的列表序号（"挂载3. 你机器上…"）。行首 "1. " 不在此列。 */
+const DECISION_GLUED_LIST = /[^\s][0-9]+\.\s/;
+/** ④ 附：UI 表格/代码围栏残片（决策里不会出现制表符线和三反引号） */
+const DECISION_UI_DUMP = /│|\u0060{3}/;
+/** ⑤ 问句结尾 */
+const DECISION_QUESTION_END = /(?:吗|[？?])\s*$/;
+/** ⑥ 简报/判据说明被粘回消息 */
+const DECISION_SELF_ECHO = /←|旧[:：]|整行剥掉/;
+/** ⑦ 名词短语化结尾 */
+const DECISION_NOMINAL_TAIL = /的问题$|时很关键$|的答案$/;
+/** ⑦ 附："决定权"是名词（"决定权在你/留给他"），与 v18 的"选择器"同族 */
+const DECISION_NOUN_HEAD = /^决定权/;
+/** ③ 裸名词短语判据：≤10 字 + 无谓语标记。标记集宁可放宽（放过的垃圾只是留在库里，
+ *  误杀的真决策就再也回不来了）。 */
+const DECISION_BARE_FRAGMENT = /^决定了?(?:的)?[^。！？!?\n]{0,8}$/;
+const DECISION_PREDICATE_HINT = /(?:用|走|上|接|改|选|烙|等|留|不再|要|是|会|能|该|把|将|就|仍|先|只|换|加|删|开|关|跑|试|定|让|放|弃|停|推|做|写|发|装|拆|测|查)/;
+
+/**
+ * 返回命中的判据名；null = 形状合格。
+ * 返回名字而不是布尔，是为了守门/探针能报出"被哪条杀的"——静默拒收等于把 bug 藏起来。
+ */
+function decisionShapeVeto(text: string): string | null {
+  const t = text.trim();
+  if (DECISION_OPEN_TOPIC.test(t) || DECISION_A_NOT_A.test(t)) return 'open-topic';
+  if (DECISION_CHOICE_OPEN.test(t)) return 'choice-open';
+  if (DECISION_TOPIC_TAIL.test(t)) return 'topic-tail';
+  if (DECISION_REPORT_RESIDUE.test(t) || DECISION_GLUED_LIST.test(t) || DECISION_UI_DUMP.test(t)) return 'report-residue';
+  if (DECISION_QUESTION_END.test(t)) return 'question-end';
+  if (DECISION_SELF_ECHO.test(t)) return 'self-echo';
+  if (DECISION_NOMINAL_TAIL.test(t) || DECISION_NOUN_HEAD.test(t)) return 'nominal-tail';
+  if (DECISION_BARE_FRAGMENT.test(t) && !DECISION_PREDICATE_HINT.test(t.slice(2))) return 'bare-fragment';
+  return null;
 }
 
 // [fork 1015] Phase 3 修复B：引号不配对=腰斩碎片。
@@ -390,9 +477,23 @@ export function parenDepthOk(raw: string): boolean {
   return true;
 }
 
-export function extractDecisions(msgs: Msg[]): ExtractedMeta['decisions'] {
+/** 单会话决策上限（D22 上下文护栏）。**限制本身保留**——简报只显示前几条，10 条已够用；
+ *  但"到 10 条就 return"是 bug：长会话后面拍板的结论静默丢失，且毫无痕迹。
+ *  [1021 红队 #额外] 实测：12 条独立合规决策 → 只出 10 条。
+ *  处置（不取消上限，因为既有单测 extract.spec.ts:79 钉死 ≤10，那条测试不在本文件里）：
+ *    ① 上限提成常量并**继续扫描**剩余句子，如实数出被丢的条数；
+ *    ② 计数挂在数组的 dropped 属性上——JSON.stringify 只序列化下标，落库数据形状不变；
+ *    ③ summaryRule 把它写进 summary_rule，于是**简报/库摘要里能看到"还有 N 条没提取"**，
+ *       不再是无声无息的丢失。要真正提高上限，需同时改上面那条单测。 */
+export const DECISION_LIMIT = 10;
+
+/** 决策列表：数组本体 + 截断计数（不在下标里，不污染 JSON.stringify 的结果） */
+export type DecisionList = ExtractedMeta['decisions'] & { dropped?: number };
+
+export function extractDecisions(msgs: Msg[]): DecisionList {
   const out: ExtractedMeta['decisions'] = [];
   const seen = new Set<string>();
+  let dropped = 0;
   for (const m of msgs) {
     for (const s of sentences(m.content)) {
       for (const re of DECISION_RES) {
@@ -421,13 +522,16 @@ export function extractDecisions(msgs: Msg[]): ExtractedMeta['decisions'] {
         const key = text.slice(0, 20);
         if (seen.has(key)) break;
         seen.add(key);
-        out.push({ text, seq: m.seqNum, at: m.createdAt ?? undefined, kind: isNegativeDecision(text) ? 'negative' : 'decision' });
-        break;;
+        // 到上限后**继续扫**（只计数不落库）：丢了几条必须能说出来，否则就是静默丢结论。
+        if (out.length >= DECISION_LIMIT) { dropped++; break; }
+        out.push({ text, seq: m.seqNum, msgId: m.id, at: m.createdAt ?? undefined, kind: isNegativeDecision(text) ? 'negative' : 'decision' });
+        break;   // [1021 红队 R14] 原为 `break;;`：多出来的分号是一个空语句（AST 层面无意义字符），
+                 // 靠正则改这段的人会被它误导。行为不变 —— 空语句不产生任何效果。
       }
-      if (out.length >= 10) return out;
     }
   }
-  return out;
+  if (dropped > 0) (out as DecisionList).dropped = dropped;
+  return out as DecisionList;
 }
 
 // ── key_questions：用户问句 + 未决启发式 ──
@@ -476,6 +580,74 @@ function normalizeQuestion(q: string): string {
   return t.trim() || q
 }
 
+// ── [1017 夜 · U-A 真根治] 「这句后来被回答了吗」 ──
+//
+// 病历（docs/research/2026-10-18-U-A未决段处置调研.md §2.5，实测）：
+//   被标 unresolved 的 7 条，其后各有 **305~524 条 assistant 消息** —— 7/7 全被答过。
+//   原因不是"判得不准"，是**根本没有这一维**：原判据只有
+//     unresolved = tailAsked（位置靠后）|| UNRESOLVED_HINT（关键词命中）
+//   于是"未决"与"未答"在实测上不相关。
+//
+// 判据设计（三条纪律）：
+//   ① **只看问题之后的 assistant 消息**（之前的回复不算回答）—— 顺序在 msgs 里，不需要时间戳；
+//   ② 命中判据用"实词重叠"，且必须**同时**满足：与问题共享 ≥2 个实词（共享 1 个在中文里太容易偶然命中）；
+//   ③ **宁可判"未答"也不误判"答过"**：判"答过"= 这条不再进未决段（漏掉真问题的代价更高），
+//      所以窗口只取问题之后**前 N 条**回复（真回答通常紧跟其后），且 N 给小值。
+//
+// ⚠️ 它是**抽取期**判据，与显示期的四条过滤器是两层：这里决定"算不算未决"，
+//    过滤器决定"值不值得显示"。调研件 §5 明确：病根在这一层，过滤器没坏别动。
+
+/** 回答检测的窗口：问题之后最多看多少条 assistant 消息 */
+const ANSWER_LOOKAHEAD = 12;
+/** 共享实词数下限（1 太松：中文里单个词偶然重合很常见） */
+const ANSWER_MIN_SHARED = 2;
+
+/**
+ * 从文本里取"实词"。
+ *
+ * ⚠️ 必须走**项目自己的分词器**（segment），不能自己写字符级切分：
+ *   第一版按 [\u4e00-\u9fff]{2,6} 贪婪切，把"量化档位到底应该怎么选"切成一个 6 字块，
+ *   而回答里的"量化档位"只切出 4 字块 —— 两边词表根本对不上，实测集成用例直接判错。
+ *   分词器是**索引与查询共用的唯一实现**（tokenizer.ts 开头的铁律），这里必须同源。
+ */
+function contentWords(text: string): Set<string> {
+  const out = new Set<string>();
+  try {
+    for (const t of segment(String(text || ''), { keepSingles: false })) {
+      if (t.length >= 2) out.add(t);
+    }
+  } catch { /* 分词器不可用（极端情况）→ 退化为空集 = 判"未答"，与"宁缺勿滥"一致 */ }
+  return out;
+}
+
+/** 这句话像不像"又被问了一遍"（而不是回答） */
+function looksLikeQuestion(s: string): boolean {
+  return /[？?]\s*$/.test(s) || Q_HINT.test(s);
+}
+
+/**
+ * 问题 q 在其后窗口内是否被回答过。
+ *
+ * @param msgs    整个会话的消息（按 seq 升序）
+ * @param askIdx  问题所在消息的下标
+ * @param q       问题文本
+ */
+export function wasAnswered(msgs: Msg[], askIdx: number, q: string): boolean {
+  const qw = contentWords(q);
+  if (qw.size === 0) return false;
+  let seen = 0;
+  for (let i = askIdx + 1; i < msgs.length && seen < ANSWER_LOOKAHEAD; i++) {
+    if (msgs[i].role !== 'assistant') continue;
+    seen++;
+    // 只取前 1500 字：回答通常在开头就给结论，全文扫会把"顺带提一句"也算成回答
+    const head = String(msgs[i].content || '').slice(0, 1500);
+    const aw = contentWords(head);
+    let shared = 0;
+    for (const w of qw) if (aw.has(w)) { shared++; if (shared >= ANSWER_MIN_SHARED) return true; }
+  }
+  return false;
+}
+
 export function extractQuestions(msgs: Msg[]): ExtractedMeta['questions'] {
   const total = msgs.length;
   const out: ExtractedMeta['questions'] = [];
@@ -488,8 +660,14 @@ export function extractQuestions(msgs: Msg[]): ExtractedMeta['questions'] {
   // 又不会把两个不同的短问题合并（短问题 28 字已覆盖全文）。
   const seenQ = new Set<string>();
   const qKey = (s: string): string => s.replace(/[\s，。！？、,.!?;；:：]/g, '').slice(0, 28);
-  msgs.forEach((m, idx) => {
-    if (m.role !== 'user') return;
+  // [1021 红队 R2 修复] 原来是 `msgs.forEach(...)` + 循环内 `if (out.length >= 10) return;`。
+  //   **`forEach` 回调里的 `return` 只退出这一条消息的回调，不退出循环** ⇒ 10 条上限形同虚设。
+  //   实测（红队探针）：30 条用户提问 → 返回 30 条。库里已有 11/620 场超过 10 条，最高 35 条。
+  //   同文件其余三个抽取器（决策/文件/话题）都用 `for...of` + `return out`，只有这里写成 forEach。
+  //   改成 for 循环后 `return out` 才真的结束整个函数。
+  for (let idx = 0; idx < msgs.length; idx++) {
+    const m = msgs[idx];
+    if (m.role !== 'user') continue;
     for (const s of sentences(m.content)) {
       if (!Q_MARK.test(s) || s.length < 8 || !Q_HINT.test(s)) continue;
       // [fork 0924] 问题也要过碎片守卫：列表项/表格行/粗体残片不是真问题（mc 整合包反馈同族）
@@ -506,12 +684,16 @@ export function extractQuestions(msgs: Msg[]): ExtractedMeta['questions'] {
       out.push({
         q: qText,
         seq: m.seqNum,
+        msgId: m.id,
         at: m.createdAt ?? undefined,
-        unresolved: tailAsked || UNRESOLVED_HINT.test(s),
+        // [1017 夜 · U-A 真根治] 加第三维：**这句后来被回答了吗**。
+        // 原判据（位置 ∨ 关键词）实测与「未答」不相关（7/7 都被答过，其后 305~524 条 assistant）。
+        // 现在：位置/关键词只决定「候选」，是否真未决由 wasAnswered 复核。
+        unresolved: (tailAsked || UNRESOLVED_HINT.test(s)) && !wasAnswered(msgs, idx, s),
       });
-      if (out.length >= 10) return;
+      if (out.length >= 10) return out;   // 现在真的结束整个函数（见上方 R2 修复注释）
     }
-  });
+  }
   return out;
 }
 
@@ -568,10 +750,15 @@ export interface EnvFact {
   values: string[];
   seq: number;
   at?: string;
-  /** 命中的模式族——精度按族分别报（§4.5：组内单独报，不报总平均） */
+  /** 命中的模式族——精度按族分别报（§4.5：组内单独报，不报总平均）
+   *  ⚠️ 只有**两族**是可达的（1021 红队 R14）：旧声明里的 `'installed-at'` 从来没有
+   *  任何产出 —— extractEnvFacts 里 family 的三元表达式只有两支（是/为 → spec-is-value，
+   *  其余 → subject-spec-pred），"安装在/放在"的句子全落进 subject-spec-pred。
+   *  留着它会让"按族精度"报告出现一个**恒为 0 的族**，读起来像"该族零误报"。
+   *  已从联合类型删除；真要按"安装位置"分族就得改判据，那是另一次带实测的变更。 */
   family: EnvFamily;
 }
-export type EnvFamily = 'subject-spec-pred' | 'spec-is-value' | 'installed-at';
+export type EnvFamily = 'subject-spec-pred' | 'spec-is-value';
 
 /** 环境事实抽取（Phase 2 方案 B）。只挖 user 消息——归属错位是头号误报源（§3.3.C） */
 export function extractEnvFacts(msgs: Msg[]): EnvFact[] {
@@ -901,6 +1088,12 @@ export function summaryRule(
   const lines: string[] = [title ?? '（无标题）'];
   if (meta.decisions.length > 0) {
     lines.push(`决策（${meta.decisions.length}）：` + meta.decisions.slice(0, 5).map((d, i) => `${i + 1}) ${d.text.slice(0, 60)}`).join(' '));
+  }
+  // [1021 红队 #额外] 超上限的决策**在这里显形**：summary_rule 会落库并进简报，
+  // 用户/下一个 AI 能看到"还有 N 条没提取"，而不是以为这个会话只定了 10 条。
+  const dropped = (meta.decisions as DecisionList).dropped ?? 0;
+  if (dropped > 0) {
+    lines.push(`⚠️ 另有 ${dropped} 条决策超过单会话上限（${DECISION_LIMIT} 条）未入库——要看全文请翻原会话`);
   }
   const unresolved = meta.questions.filter((q) => q.unresolved);
   if (unresolved.length > 0) {

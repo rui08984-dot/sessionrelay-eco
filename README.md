@@ -3,21 +3,26 @@
 > **让你的 AI 记住这个项目**：决策、未决问题、最近在动的东西，在你开口之前就摆到它面前。
 > 本地优先 · 零神经网络 · 完全离线可用 · 一个项目一个库。
 
-本项目是 [SessionRelay](https://github.com/EwanJasper/SessionRelay)（MIT）的深度改造，外加**两端集成**，
+本项目是 [SessionRelay](https://github.com/EwanJasper/SessionRelay)（MIT）的**独立演进版**——已不跟随上游，外加**三端集成**（DSH / ZCode / Codex），
 一个仓库装下全部内容。
 
 ---
 
 ## ⬇️ 先看你用哪个客户端，就下哪个
 
-| 你在用什么 | 下载 | 干什么用的 | 大小 |
-|---|---|---|---|
-| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.2.zip** | 每轮自动把项目简报注入 system prompt | ~20MB（自带运行时） |
-| **ZCode** | **zcode-adapter-1.0.2.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~21KB |
-| 两个都用 / 新机器一次装齐 | **ses-offline-\<日期\>.zip** | 全家桶：内核产物 + 插件 + 适配器 + 技能 + 工具 | ~20MB |
+| 你在用什么 | 下载 | 干什么用的 | 大小 | 要 trust 吗 |
+|---|---|---|---|---|
+| **DeepSeek Harness (DSH)** | **dsh-plugin-0.2.3.zip** | 每轮自动把项目简报注入 system prompt + 图形面板 | ~21MB（自带运行时） | 否 |
+| **ZCode** | **zcode-adapter-1.0.2.zip** | 开场简报 + **每轮相关召回**（SessionStart + UserPromptSubmit） | ~32KB | 否 |
+| **Codex** | **codex-adapter-1.0.0.zip** | 开场简报 + 13 个 MCP 工具 + 交接技能 | ~35KB | **是** |
+| 全都用 / 新机器一次装齐 | **ses-offline-\<日期\>.zip** | 全家桶：内核产物 + 插件 + 适配器 + 技能 + 工具 | ~20MB | — |
 
-三个包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
-**两个客户端都还需要内核**（记忆本体）——从源码装一次即可，见下面「三分钟装上」。
+四个包都在 **[Releases](https://github.com/rui08984-dot/sessionrelay-eco/releases/latest)** 页。
+**三个客户端都还需要内核**（记忆本体）——从源码装一次即可，见下面「三分钟装上」。
+
+> **Codex 用户先看这条**：装完还必须在 Codex 里输入 `/hooks` 手动 trust 一次，钩子才会运行。
+> 不 trust 的症状是「装好了但什么都没注入」—— 不是坏了，是还没批准。
+> 这是 Codex 的安全设计，脚本无法代劳（详见包内 `README-INSTALL.md`）。
 
 ### 傻瓜式安装（每端三步）
 
@@ -75,7 +80,7 @@ SessionStart hook 组装简报塞进会话开场。任何失败 = 空输出 = �
 > 完整步骤（含离线、沙箱验证、卸载回滚）：**[INSTALL.md](INSTALL.md)**
 
 ```bash
-# 1) 内核：装到全局（两个客户端共用）
+# 1) 内核：装到全局（三个客户端共用）
 cd packages/core && npm install && npm run build && npm i -g .
 
 # 2) 给某个项目建记忆库
@@ -147,7 +152,7 @@ srelay lesson maintain          # 年龄衰减 / 退休 / 复活
 srelay lesson export            # 导出 Markdown（人可读、可 git、可手改）
 ```
 
-### 注入预算（两端不同，都不挤占简报）
+### 注入预算（各端不同，都不挤占简报）
 
 | 端 | 时机 | 预算 |
 |---|---|---|

@@ -41,7 +41,7 @@
 // ═══ 已知未实测项 ═══
 // cwd 字段尚未在真实 DSH 组装中打过日志（启动 DSH 不触发组装，需真实一轮对话）。
 // 已用「cwd 优先 + slug 回落」防御：取不到时行为与旧版一致。
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -51,12 +51,14 @@ import { fileURLToPath } from 'node:url'
 // 历史上两侧手抄导致过滤器漂移（DSH 多一条而 ZCode 没有，用户日常在 ZCode 侧干活）。
 import { passesBriefFilters } from './src/brief-filters.mjs'
 import { resolveProjectRoot, shouldAutoInit } from './project-resolve.mjs'
-import { searchTool, showTool, recordTool, bindProjectTool, confirmBindTool, cancelBindTool, initProjectTool } from './src/tools.js'
+import { searchTool, showTool, recordTool, bindProjectTool, confirmBindTool, cancelBindTool, initProjectTool,
+         relatedTool, historyTool, decisionsTool, unresolvedTool, statsTool, pinTool } from './src/tools.js'
 import { setStorageAdapter, disposeBindState } from './src/state.js'
-import { queryBriefData, sqlChannelAvailable, queryRecentFiles } from './src/brief-sql.mjs'
+import { queryBriefData, sqlChannelAvailable, queryRecentFiles, foldPresentation } from './src/brief-sql.mjs'
+import { registerHooks } from './src/hooks.mjs'
 import { experiencesLine } from './src/brief-experiences.mjs'
 import { decisionModulesText } from './src/brief-modules.mjs'
-import { passesUnresolvedFilters } from './src/brief-filters.mjs'
+import { passesUnresolvedFilters, UNR_SLOTS } from './src/brief-filters.mjs'
 
 export const name = 'dsh-srelay-brief'
 export const inject = ['systemPrompt', 'tools']
@@ -84,7 +86,16 @@ const FRESH_MS = 48 * 3600_000
 // CLI 兜底路出 2 条"，而 self              est 的"两条路正文逐字节一致"正是抓这个的。
 // 同一处知识多份副本，是这个项目反复吃的病。
 const DEC_SLOTS = 4
-const UNR_SLOTS = 3
+// [1017 夜 U-A 降级] UNR_SLOTS 3 → 1。依据 docs/research/2026-10-18-U-A未决段处置调研.md：
+//   实测注入了 3 条，其中 2 条是残片（precision ≈ 1/3），而且 3 条**全部来自同一个老会话**
+//   （该会话 7 条"未决"其后各有 305~524 条 assistant 消息 ⇒ 早被答过，"未决"与"未答"不相关）。
+//   名额从 3 降到 1 是**降级**不是终态：配 7 天 precision 门禁，仍 <50% 就转"砍掉不渲染"。
+//   反悔很简单 —— 把数字改回 3（**改内核 recall 那一处**，三运行时一起生效）。
+//
+// [1017 夜 12d 归核] 这里原来是自己写的 `const UNR_SLOTS = 1`（第三份副本）。
+//   判据收进内核 dist/recall.js 的导出面后，插件改为 import 权威值，物理消灭第三份。
+//   brief-filters.mjs 拿不到 recall 时会退回内置 1（只影响「无内核」的自包含场景）。
+//   （值本身由 brief-filters.mjs 从内核 recall 转发，见那里的 __unresolvedFromRecall）
 const COLD_SYNC_TIMEOUT_MS = 1500 // 冷缓存同步预热上界：最坏慢一轮，不挂住组装
 const WARM_REFRESH_MS = 60_000   // 热缓存定时刷新
 const CACHE_TTL_MS = 5_000
@@ -106,6 +117,50 @@ const CHATTER_TITLE = /^(你好|哈喽|您好|hi+|hello|hey|test|测试|在吗|�
 // 会话里有"改用 fileURLToPath()"这种真决策（1015 实测，两个候选判据都试过）。
 const SUBAGENT_TASK_TITLE = /^(你是|你作为|任务[:：]|你的任务|act as|you are)/i
 
+// ── [1021] 守护自愈：治「每次重启 DSH 面板都显示离线」的**真正根因** ──
+//
+// 实测链条（别再从头查一遍）：
+//   ① 面板显示离线 → 读项目锁 → 心跳过期 → 看起来像「守护没起」；
+//   ② 但真去起一个，它立刻退出：「全局锁被占（另一守护在跑）」；
+//   ③ 查那个 pid：**进程活着**、管道也连得上，但**心跳 96 秒没更新**（应该 15 秒一次）。
+//   ⇒ 有个**僵尸守护**：进程没死、管道没放，但事件循环卡住了。
+//     每次重启 DSH 都撞到它，所以面板永远离线，**用户重启多少次都没用**。
+//
+// 修法：起新守护之前先做健康判定 —— 锁里有 pid 且活着、但心跳过期 ⇒ 判定僵尸、杀掉，再 spawn。
+const DAEMON_ZOMBIE_MS = 120_000
+const DAEMON_CHECK_COOLDOWN_MS = 60_000
+const daemonLastTry = new Map()
+
+function readDaemonLock(root) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(root, '.sessionrelay', 'lock'), 'utf8'))
+    const pid = Number(j.pid)
+    const hb = Number(j.heartbeat)
+    if (!Number.isFinite(pid) || !Number.isFinite(hb)) return null
+    let pidAlive = false
+    try { process.kill(pid, 0); pidAlive = true } catch { pidAlive = false }
+    return { pid, ageMs: Date.now() - hb, pidAlive }
+  } catch { return null }
+}
+
+function ensureDaemon(root) {
+  try {
+    if (!root) return
+    const st = readDaemonLock(root)
+    if (st && st.pidAlive && st.ageMs <= DAEMON_ZOMBIE_MS) return
+    if (st && st.pidAlive && st.ageMs > DAEMON_ZOMBIE_MS) {
+      try { process.kill(st.pid) } catch { /* 已经死了更好 */ }
+    }
+    const last = daemonLastTry.get(root) || 0
+    if (Date.now() - last < DAEMON_CHECK_COOLDOWN_MS) return
+    daemonLastTry.set(root, Date.now())
+    const child = spawn(NODE, [SRELAY, 'watch', '--foreground', '--global'], {
+      cwd: root, detached: true, stdio: 'ignore', windowsHide: true,
+    })
+    child.on('error', () => { /* 起不来不影响简报，下个冷却周期再试 */ })
+    if (typeof child.unref === 'function') child.unref()
+  } catch { /* 任何异常都不许挡住简报 */ }
+}
 function runSrelay(args, root, timeoutMs) {
   return new Promise((resolve) => {
     execFile(NODE, [SRELAY, ...args],
@@ -170,9 +225,17 @@ function itemsFromArray(arr, key, max) {
       return !SUBAGENT_TASK_TITLE.test(String(d.title ?? '').trim())
     })
     .filter((d) => {
-      // 置顶决策豁免新鲜度窗——置顶的意义就是"老决策也要进简报"。
+      // 置顶豁免新鲜度窗——置顶的意义就是"重要的老条目也要进简报"。
       // 三个月前拍板的架构选择若被 48h 窗滤掉，置顶就形同虚设。
-      if (key === 'decisions' && d.pinned === true) return true
+      //
+      // [1017 夜 10:2x 修一条真实语义分叉] 原来这里写的是 `key === 'decisions' && d.pinned === true`，
+      //   而本函数上面两层（175/179）的置顶豁免**都不看 key** —— 同一份文件里三条豁免自相矛盾：
+      //   决策链豁免、未决链的过滤器层豁免，但未决链的新鲜度窗不豁免。
+      // 实测后果（守门 §⑦c 第一次真跑就抓到）：一个 30 天前被 pin 的未决问题，
+      //   DSH 侧**被 48h 窗砍掉**、ZCode 侧**留着** ⇒ 两个运行时显示的未决段内容不同。
+      // ZCode 侧那句注释把意图写得很清楚：置顶的意义就是重要的条目也要进简报，
+      //   再被 48h 窗滤掉就自相矛盾了 —— 所以未决链也该豁免，原来那个 key 限定是漏的。
+      if (d.pinned === true) return true
       const at = Date.parse(d.at ?? d.msgAt ?? '')
       return !Number.isFinite(at) || at >= cutoff
     })
@@ -187,21 +250,12 @@ function itemsFromArray(arr, key, max) {
   //   "采用渐进式披露（Progressive Disclosure），平时只在上下文中注入描述信息…"
   // 40 字去重键抓不住（两句话第 31 字就分岔），二元组相似度也抓不住（Jaccard≈0.38）——
   // 它们是"语义相同、字面不同"，任何词法判据都不稳。
-  // 实测过的替代判据：**前 14 字前缀键**。在简报取数顺序的前 60 条里，
-  //   music 合并 3 组 7 条（逐条读过，全部是同一决策的不同写法：渐进式披露 / pwsh 拉取 / one-search MCP），
-  //   agent1super 合并 0 条。即"该合的合、不该合的不动"。
-  // 放在排序之后 = 保留最新那条（上面刚按时间倒序排完）。
-  const PrefKey = () => {
-    const seen = new Set()
-    return (d) => {
-      if (d.pinned === true) return true // 置顶豁免：用户显式留的东西不合并
-      const k = textOf(d).replace(/[\s，。！？、,.!?;；:：|｜`"']+/g, '').slice(0, 14)
-      if (!k || seen.has(k)) return false
-      seen.add(k)
-      return true
-    }
-  }
-  const deduped = fresh.filter(PrefKey())
+  // [1017] 判据来源换成**核心那一份**：foldNearDuplicates（二元组重叠 + 长度比门 + 置顶优先），
+  // 取代原先自建的"前 14 字前缀键"。病历：前缀键误杀过干净决策「采用 Vite 作为前端构建工具」，
+  // 留下 62 字粘连噪声（长度比 3.88）——判据只许有一份（铁律 1），所以这里不再自己写一套。
+  // 折叠就在此处（渲染出口）：两条取数通道都走 itemsFromArray ⇒ 渲染结果必然一致，
+  // 而各自的原始数据仍是 CLI 那套逐字段一致的数据（8b 的 parity 断言比的是数据通道）。
+  const deduped = foldPresentation(fresh)
   return deduped.slice(0, max).map((d) => {
     const text = clipAt(textOf(d), 90)
     // ADR-001：否定性决策加 ✗ 前缀。"改用 Y"与"采用 Y"此前在简报里长得一样，
@@ -551,6 +605,7 @@ export function apply(ctx) {
 
   const refresh = (root) => {
     if (disposed || inflight.has(root)) return
+    ensureDaemon(root)   // [1021] 顺手确保守护在跑（含存活判据 + 60s 冷却，见 ensureDaemon）
     const p = buildBrief(root)
       .then(text => { cache.set(root, { text, at: Date.now() }) })
       .catch(() => { /* 刷新失败保留旧值，下轮再试 */ })
@@ -567,6 +622,16 @@ export function apply(ctx) {
       return () => { disposed = true; clearInterval(timer); cache.clear(); inflight.clear(); disposeBindState(); autoInitTried.clear() }
     })
   } catch { /* ctx.effect 不可用（旧版 Cordis）：退化为无定时器，刷新靠冷/热路径触发 */ }
+
+  // ── ADR-002：把生命周期挂到 DSH 的真钩子上（会话事件驱动采集）──────────────
+  // 病历（ADR-002 原文）："我们现在一个钩子都没挂；采集靠外部守护轮询" —— 用户刚拍板的决定
+  // 要等下一轮采集（最长 15 分钟）才进库。这里挂 session/event、session/disposed、agent/status，
+  // 按项目去抖 8 秒 + 冷却 60 秒后做一次**单项目增量采集**（进程内调内核 runSync，不起子进程）。
+  // 只跑轻活：全量重放/老化压缩一律留给独立进程，绝不在宿主里跑。
+  try {
+    const r = registerHooks(ctx, { log: (m) => { if (process.env.SRELAY_BRIEF_DEBUG) console.error(m) } })
+    if (r?.registered?.length && process.env.SRELAY_BRIEF_DEBUG) console.error('[srelay-hooks] registered: ' + r.registered.join(','))
+  } catch (e) { /* 钩子挂不上不影响简报与工具（旧宿主/无内核副本） */ }
 
   // ⚠️ 只注册一个 section。按项目注册多个同名 section 会按契约 throw；
   // 若把那个错误 catch 掉，后续 agent 会静默渲染第一个 agent 的内容——
@@ -664,7 +729,11 @@ export function apply(ctx) {
   } catch { /* 非 DSH 环境：简报已注册，工具缺席 */ }
   if (typeof defineTool !== 'function') return
 
-  const allTools = [searchTool, showTool, recordTool, bindProjectTool, confirmBindTool, cancelBindTool, initProjectTool]
+  // [1021 满血版] 13 个，与 MCP 侧（srelay serve）能力对齐 ——
+  //   同一个产品的两面不该能力不一样。新增的 6 个只是把 CLI **已有**的命令包成工具，
+  //   没另写内核逻辑（判据仍只有一份）。
+  const allTools = [searchTool, showTool, recordTool, bindProjectTool, confirmBindTool, cancelBindTool, initProjectTool,
+                    relatedTool, historyTool, decisionsTool, unresolvedTool, statsTool, pinTool]
   for (const t of allTools) {
     try { ctx.tools.register(t) } catch { /* 单个失败不拖垮其他 */ }
   }

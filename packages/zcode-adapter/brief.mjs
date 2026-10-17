@@ -102,7 +102,14 @@ const srelay = (args) => {
 };
 
 try {
-  const hasStack = existsSync(join(root, '.sessionrelay'));
+  // ⚠️ [1017 夜 · 实地测试抓到的真 bug] 这里必须是 `let` —— 它在下面 127 行会被赋值
+  //   （自动接入成功后把 hasStack 置真）。原先是 `const` ⇒ 每次「自动建库」成功之后
+  //   钩子立刻抛 `Assignment to constant variable`，被顶层 catch 吞成一行 stderr，
+  //   结果是：**库建出来了、但这一轮什么简报都没注入**。
+  //   症状极具欺骗性：新工作区第一次开会话「看着建好了，就是没有记忆」。
+  //   实测复现：在一个工作区外的全新目录跑 SessionStart 钩子 —— 库 188KB 建出来了，
+  //   同时 stderr 打出 `[statebrief] Assignment to constant variable.`，stdout 无简报。
+  let hasStack = existsSync(join(root, '.sessionrelay'));
   const scratchDir = join(root, '.scratch');
   const handoffDir = join(scratchDir, 'handoff');
   // 历史信号=交接链（.scratch/handoff/*.md）或进度锚（.scratch/ 直属 *PROGRESS*.md，progress-anchor 约定锚位）

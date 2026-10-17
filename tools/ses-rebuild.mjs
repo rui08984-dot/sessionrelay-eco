@@ -10,7 +10,7 @@
 //   node tools/ses-rebuild.mjs --no-guard # 只重建与镜像（赶时间时用，别常用）
 //
 // ⚠️ 重建前**必须删 dist**：直接跑 tsup 会留下上一轮的 hash 命名 chunk（实测 52 → 87 个文件）。
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -47,6 +47,82 @@ step(2, "镜像 dist 到全部运行时副本（含 .pnpm）");
 }
 
 step(3, "镜像插件源码到其余副本（含 .pnpm 硬链接那份）");
+
+// ── 部署后的进程换新（1017 夜补）────────────────────────────────────────────
+// 病历：重建把磁盘代码换了新，但**已经在跑的守护还握着旧代码** —— check-versions C 段
+// 反复报"pid X 启动早于最新构建，跑的是旧代码"，而换新原先靠一个外挂脚本的守护阶段来做，
+// 那个脚本已按 ADR-002 退役。原则很简单：**谁把代码变新，谁负责让进程换新**，
+// 所以这一步属于构建管线（而不是又一个巡检脚本）。启动命令只在这里写一份。
+function restartWatchDaemon() {
+  try {
+    const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*srelay.js*watch*' } | ForEach-Object { $_.ProcessId.ToString() }";
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+    const pids = out.trim().split(/\r?\n/).filter(Boolean).map((x) => Number(x.trim())).filter(Number.isFinite);
+    // ⚠️ 2026-10-17 实测两处"采集停摆"：① 没有旧进程时这里直接 return（守护就一直没起来）；
+    //    ② "杀旧→立刻起新"之间不等管道释放 ⇒ 新实例抢不到全局管道锁就自己退出，一个都不剩。
+    //    所以现在：不管有没有旧进程都要**保证换完之后有一个在跑**，并验证活着。
+    if (!pids.length) console.log("       守护原本没在跑 —— 直接拉起（以前这里是'跳过换新'，于是采集停摆没人管）");
+    for (const p of pids) { try { process.kill(p); } catch { /* 已退出 */ } }
+    // 等内核管道对象随进程消失（不等这一下，新实例会 acquirePipeLockByName 失败后静默退出）
+    if (pids.length) { const t0 = Date.now(); while (Date.now() - t0 < 4000 && watchGlobalPids().length) { busyWait(150); } }
+    const logDir = path.join(HERE, '.sessionrelay', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const fd = fs.openSync(path.join(logDir, 'watch.log'), 'a');
+    const child = spawn(process.execPath, [path.join(HERE, 'core', 'SessionRelay', 'dist', 'srelay.js'), 'watch', '--global'],
+      { cwd: HERE, detached: true, windowsHide: true, stdio: ['ignore', fd, fd] });
+    child.unref();
+    fs.closeSync(fd);
+    // 验证真的活着；不行就重试 —— 拉不起来必须**吼出来**（并让汇总判失败）
+    let alive = false;
+    for (let attempt = 1; attempt <= 3 && !alive; attempt++) {
+      const t1 = Date.now(); while (Date.now() - t1 < 2500 && !watchGlobalPids().length) busyWait(150);
+      alive = watchGlobalPids().length > 0;
+      if (!alive) { try { process.kill(child.pid); } catch { /* 已退出 */ } }
+    }
+    if (alive) console.log("       守护已换新（旧 " + (pids.join(',') || '无') + " → 新 pid " + child.pid + "，已确认存活）");
+    else { console.log("       🔴 守护拉不起来（连试 3 次）—— 采集会停摆，看 .sessionrelay/logs/watch-global.log"); return false; }
+    return true;
+  } catch (e) { console.log("       ⚠️ 换新失败：" + String(e && e.message).slice(0, 70)); return false; }
+}
+
+/** 列出**全局**守护 pid（只看 --global：项目级 --foreground 是别的东西，别误杀） */
+function watchGlobalPids() {
+  // ── [1021] 改用**项目锁**判活，PowerShell 只作补充 ──
+  //
+  // 病历：这里原来只靠 `Get-CimInstance ... -like '*srelay.js*watch --global*'`。
+  //   同一个假阴性本轮出现了**两次**：守护锁心跳 3 秒、watch.log 还在滚，
+  //   但命令行匹配不到（引号/npx 包装/执行策略都可能变）⇒ 判成「一个都没起」⇒
+  //   构建管线连试 3 次全失败，报「守护拉不起来，采集会停摆」。
+  //   而实际上守护好好的。
+  //
+  // 现在：先读锁（守护自己写的，唯一权威），读不到再用进程表兜底。
+  const locked = [];
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(HERE, '.sessionrelay', 'lock'), 'utf8'))
+    const age = Date.now() - Number(j.heartbeat)
+    let up = false
+    try { process.kill(Number(j.pid), 0); up = true } catch { up = false }
+    if (up && age < 60_000) locked.push(Number(j.pid))
+  } catch { /* 没锁就靠进程表 */ }
+  if (locked.length) return locked
+  const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*srelay.js*watch*' } | ForEach-Object { $_.ProcessId.ToString() }"
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 30000 })
+    return out.trim().split(/\r?\n/).filter(Boolean).map((x) => Number(x.trim())).filter(Number.isFinite)
+  } catch { return [] }
+}
+const busyWait = (ms) => { const t = Date.now(); while (Date.now() - t < ms) { /* 同步等：构建脚本里用 async 反而更绕 */ } };
+if (!restartWatchDaemon()) fail.push('守护换新');
+// 面板插件：vendor/dist 同步 + 装进 profile（含 pnpm install）。
+// ⚠️ 必须排在下面 _mirror_plugin.mjs **之前**：pnpm 会用缓存快照重建 file: 依赖的 .pnpm 副本，
+//    而那个副本才是 DSH 真正加载的路径 —— 让镜像步骤在它之后跑，才能把被还原的旧文件补回来。
+{
+  const r = run(NODE, [path.join(HERE, "tools", "ses-panel-install.mjs"), "--apply"], HERE);
+  const lines = r.out.trimEnd().split(/\r?\n/).filter((l) => /[①②③④⑤⑥]|✅|🔴|作者副本/.test(l));
+  console.log("  " + (r.code === 0 && !r.out.includes("🔴") ? "✅" : "🔴") + " 面板插件（ses-panel-install）");
+  for (const l of lines.slice(-8)) console.log("      " + l.trim().slice(0, 150));
+  if (r.code !== 0 || r.out.includes("🔴")) fail.push("面板插件安装");
+}
 {
   const r = run(NODE, [path.join(HERE, "tools", "_mirror_plugin.mjs")], HERE);
   console.log(r.out.trimEnd());
@@ -69,7 +145,12 @@ if (PACK) {
     // 二进制不入 git（20MB×N），所以**用一份台账替代版本控制**：当前包是谁、指纹多少、怎么重建。
     // 同时把"被取代的旧包"点名列出来——留着它们不是错，但必须能一眼看出哪个是当前的。
     const arts = fs.readdirSync(path.join(HERE, "artifacts")).filter((f) => f.endsWith(".zip")).sort();
-    const superseded = arts.filter((f) => f !== path.basename(out)).map((f) => "ses-offline 旧包 `" + f + "`（已被取代，可删）");
+    // ⚠️ [1017 夜] 原来这里按「artifacts 下所有 .zip」算，**把当期的三个客户端包也列成「被取代」**
+    //（dsh-plugin / zcode-adapter / dsh-panel 全被点名要删）。它们是**当前资产**，不是旧离线包 ——
+    // 真照着删，发布步骤会直接少三个附件，而这个台账会天天骗人。改成只筛 ses-offline- 前缀。
+    const superseded = arts
+      .filter((f) => f.startsWith('ses-offline-') && f !== path.basename(out))
+      .map((f) => 'ses-offline 旧包 ' + f + '（已被取代，可删）');
     fs.writeFileSync(path.join(HERE, "artifacts", "LATEST.md"), [
       "# 离线整合包台账（自动生成，勿手改）",
       "",
@@ -111,6 +192,20 @@ if (!NOGUARD) {
     // [B6] 不变量守门：同一条规则只准有一份实现（静态）+ 两条行为断言的存在性
     ["check-invariants", [path.join(HERE, "tools", "check-invariants.mjs")]],
     ["插件 selftest", [path.join(HERE, "plugins", "dsh", "selftest.mjs")]],
+    // [1017 夜] 面板两块：① 依赖闭包（panel.js 只许 import node 内置）
+    //                       ② 宿主半真链路自测（真 HTTP 打真数据；装了没生效在这里就现形）
+    ["check-panel-deps", [path.join(HERE, "tools", "check-panel-deps.mjs")]],
+    ["面板 selftest", [path.join(HERE, "integrations", "dsh-srelay-panel", "selftest.mjs")]],
+    // [1021] 端到端简报一致性：同一份库、同一份原始数据，走 DSH 与 ZCode 两条渲染链逐条对拍。
+    //   为什么必须进守门：现有 check-brief-filters 只对拍**过滤器**（同一个函数两边跑），
+    //   抓不到「过滤器一样但取数/渲染不一样」的分叉 —— 而红队 R4 正是那个形状
+    //   （CLI 决策无时间窗、DSH/ZCode 都是 48h + pin 豁免）。不进守门的检查 = 没人跑。
+    //   无参运行 = 拿 cwd 的项目库（重建时 cwd 就是本仓，自带 .sessionrelay）。
+    ["check-brief-e2e", [path.join(HERE, "tools", "check-brief-e2e.mjs")]],
+    // [1021 审查 #18] 发布检查（MCP 工具名文档覆盖 / 旧计数 / CHANGELOG 版本 / 发布模块采集契约）。
+    //   为什么必须进守门：此前工具名抽取正则与实际 register( 调用早已脱节，检查红着半年没人知道
+    //   —— 我们天天说"七门全绿"，而这一门根本没在跑。进守门后红立刻变 overall 红。
+    ["check-artifacts", [path.join(CORE, "scripts", "check-artifacts.mjs")]],
   ];
   for (const [name, argv] of guards) {
     const cwd = name === "插件 selftest" ? path.join(HERE, "plugins", "dsh") : HERE;

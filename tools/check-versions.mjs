@@ -51,7 +51,9 @@ const PLUGIN_COPIES = [
   ['部署 headless profile', path.join(HOME, '.dsh/profiles/headless/local-plugins/dsh-srelay-brief')],
 ]
 
-const PLUGIN_FILES = ['index.js', 'project-resolve.mjs', 'selftest.mjs', 'src/brief-sql.mjs', 'src/tools.js', 'src/state.js', 'src/cli.js', 'src/define-tool.js', 'src/root-rules.mjs']
+// [1021 审查 #17] 补上 src/hooks.mjs：此前它不在清单里 ⇒ _mirror_plugin.mjs 从权威源覆盖回旧版本
+// 也查不出来（B 段"5 份完全一致"字面上绿，实际 hooks 内容早已分叉）。判据必须覆盖被判断的对象。
+const PLUGIN_FILES = ['index.js', 'project-resolve.mjs', 'selftest.mjs', 'src/brief-sql.mjs', 'src/tools.js', 'src/state.js', 'src/cli.js', 'src/define-tool.js', 'src/root-rules.mjs', 'src/hooks.mjs']
 
 function md5File(p) {
   try { return createHash('md5').update(fs.readFileSync(p)).digest('hex') } catch { return null }
@@ -100,11 +102,34 @@ for (const f of PLUGIN_FILES) {
 }
 
 say('')
+// ⚠️ 下面检测用的模式是 *srelay.js*watch*（中间**不写死空格**）：守护命令行有两种形态——
+//    node …\dist\srelay.js watch …   /   node "…\dist\srelay.js" watch …
+// 写死带空格的版本判不出带引号启动的守护 → 假报"没有守护进程在跑（采集停摆）"。
+// 1017 实测：守护 pid 58352/67776 明明在跑，这里报 0 个；生命周期驱动用的是宽容版。
 say('══════ C. 守护进程是否在跑当前磁盘代码 ═══')
+// ── [1021] 判据换成**项目锁**，不再靠 PowerShell 进程表 ──
+//
+// 病历（这段注释原本就写着）：1017 实测守护 pid 58352/67776 明明在跑，这里却报 0 个 →
+//   「假报没有守护进程在跑（采集停摆）」。当时的修法是放宽命令行匹配模式，**但根子没动**：
+//   靠 `Get-CimInstance` + 命令行字符串匹配本来就脆（引号、npx 包装、进程名大小写、执行策略都可能变）。
+//
+// 1021 又复现了一次：守护 pid 44424 锁心跳 3 秒、watch.log 还在滚，本节照样报「没有守护进程在跑」。
+//   ⇒ 现在改用**守护自己写的锁文件**判活（pid 存活 + 心跳新鲜），这是唯一权威信号；
+//   PowerShell 只用来**补充**「启动时间 vs 构建时间」这一项（那确实需要进程表）。
+const lockAlive = (() => {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.sessionrelay', 'lock'), 'utf8'))
+    const age = Date.now() - Number(j.heartbeat)
+    let up = false
+    try { process.kill(Number(j.pid), 0); up = true } catch { up = false }
+    return { ok: up && age < 60_000, pid: j.pid, ageSec: Math.round(age / 1000), up }
+  } catch { return { ok: false } }
+})()
 try {
-  const out = execSync('powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'node.exe\'\\" | Where-Object { $_.CommandLine -like \'*srelay.js watch*\' } | ForEach-Object { $_.ProcessId.ToString() + \'|\' + $_.CreationDate.ToString(\'yyyy-MM-dd HH:mm:ss\') }"', { encoding: 'utf8' })
+  const out = execSync('powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'node.exe\'\\" | Where-Object { $_.CommandLine -like \'*srelay.js*watch*\' } | ForEach-Object { $_.ProcessId.ToString() + \'|\' + $_.CreationDate.ToString(\'yyyy-MM-dd HH:mm:ss\') }"', { encoding: 'utf8' })
   const lines = out.trim().split('\n').filter(Boolean)
-  if (!lines.length) { problems++; say('  🔴 没有守护进程在跑（采集停摆）') }
+  if (!lines.length && !lockAlive.ok) { problems++; say('  🔴 没有守护进程在跑（采集停摆）') }
+  else if (!lines.length) say(`  ✅ 守护在跑：pid ${lockAlive.pid}（锁心跳 ${lockAlive.ageSec}s，进程表查询没匹配到，以锁为准）`)
   for (const l of lines) {
     const [pid, created] = l.trim().split('|')
     const newest = CLI_COPIES.map(([, d]) => { try { return fs.statSync(path.join(d, 'srelay.js')).mtimeMs } catch { return 0 } }).sort((a, b) => b - a)[0]
@@ -328,12 +353,128 @@ try {
     try {
       const out = execSync('"' + process.execPath + '" "' + cliPath + '" brief --json --limit 1', { cwd: r2, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
       fromCli = JSON.parse(out).recentFiles
-    } catch { say('  ⚪ ' + r2 + '：CLI 的 brief 命令不可用（老构建？）——跳过') ; continue }
+    } catch (e) {
+      // ⚠️ [1021 后端红队 #4] 这里原本是 `catch { say('⚪ ...跳过'); continue }` —— **跳过不计入 problems**。
+      //   实测后果（15:42:15Z）：dist 正在重建，`dist/brief-KLBQMTFZ.js` 一时不存在，
+      //   两个项目各抛 ERR_MODULE_NOT_FOUND 被跳过，最后门禁照样打印「✅ 全部一致」EXIT=0；
+      //   24 秒后重跑同样的命令变 ✅ —— **同一磁盘同一条命令两次结论不同，而第一次是绿的**。
+      //   这比红更糟：红会让人去查，假绿会让人以为没问题。
+      //   现在：跳过 = 「没验成」= 算失败。要么这次真的有结论，要么就别报绿。
+      problems++
+      say('  🔴 ' + r2 + '：CLI 的 brief 命令**没跑成**，本节未验证（' + String((e && e.message) || e).slice(0, 80) + '）')
+      continue
+    }
     let fromPlug = null
     try { fromPlug = plug.queryRecentFiles(r2, { days: 7, top: 3 }) } catch (e) { say('  ⚪ ' + r2 + '：插件侧取数失败 ' + String(e && e.message).slice(0, 60)) ; continue }
-    const same = JSON.stringify(fromCli) === JSON.stringify(fromPlug)
+    // ⚠️ [1017 夜 08:1x] 修一条长期假红（实测：连跑 6 次红 2 次）。
+    //   本节拿**核心 CLI** 与**插件 SQL** 两路分别取一次「最近在动」，而采集守护可能正好在两次读之间
+    //   写库（实测抓到 providers.json sessions 38→39、decisions 101→103）。
+    //   ⇒ 「数据在动」被误判成「两份实现漂移」，症状是「没改任何代码却报 DSH 与 ZCode 会显示不同文件集合」。
+    //
+    // 修法**不放松判据**（与 8c 同一套纪律）：判据仍是「两边必须逐字节相同」，
+    //   只是**先比对库指纹**：两次取数之间数据动过就 SKIP 并说清原因，没动才照旧判。
+    //   不修的话假红会让下一个人直接删掉这条断言 —— 那比没有这条断言更糟。
+    // ⚠️⚠️ [独立复审后重写 08:5x] 第一版这个守卫有三处**静默假绿**，复审全中，实测复核后重写：
+    //
+    //  ❶ 指纹漏掉派生列重写：`db.ts:668` 的 refresh/confirm 重算是
+    //     `UPDATE sessions SET files_mentioned=?, topics=?, decisions=?, key_questions=?, ...`
+    //     **不动 last_event_at、不插 messages、不增 sessions 数** ⇒ 旧指纹逐字恒等，
+    //     而 `brief-sql.mjs:246-279` 的「最近在动」正是从 files_mentioned + decisions 排序出来的
+    //     ⇒ 守卫不触发，判定却用两份不同快照。**必须把这两列并进指纹。**
+    //  ❷ 窗口错位：第一版 `fromPlug` 取于 st1 之前，判定却拿它跟 st1 之后的 fromCli2 比，
+    //     t1→t2 之间**裸奔**。⇒ 改成 **stamp / 两路取数 / stamp** 严格夹住，两份快照都在窗口内。
+    //  ❸ `n/a` 静默放行：`stamp()` 异常返回 `n/a`，而判定条件是 `st1 !== 'n/a'`
+    //     ⇒ node:sqlite 不可用时守卫**从不触发**，整节一路绿。⇒ 现在这种情况**直接判红并说清**。
+    //  ❹ [第三轮复审 09:1x] 上面那条仍漏了一整类：`brief-sql.mjs:245-249` 的 PROBE 过滤用的是
+    //     **四列** —— `message_count`、`origin`、`decisions`、`key_questions`，
+    //     而前五项指纹**一项都不含** `message_count`/`origin`/`key_questions`。
+    //     最要命的是 `db.ts:414` 的 `bumpMessageCount`：
+    //       `UPDATE sessions SET message_count = message_count + ? WHERE id = ?`
+    //     **每捕获一条消息就跑一次**，只写这一列 ⇒ 五项逐字恒等，
+    //     而会话一旦从 `message_count <= 2` 跨到 3 就会**进出** PROBE，输出跟着变。
+    //     另外 `decisionsLen` 是 SUM ⇒ 等量增减会归零，给上面这类写提供掩护。
+    //     ⇒ 补两项：**被 PROBE 排除的会话数**（直接对应进出）+ **key_questions 总长**。
+    //     负结果验证（静态临时库，可控）：只把 message_count 从 2 改成 3，
+    //     前五项**逐字不变**、补充项 `excl` 2→1 ⇒ 确实能抓到。
+    const STAMP_SQL = [
+      'SELECT (SELECT COUNT(*) FROM sessions) s, (SELECT MAX(rowid) FROM messages) m,',
+      " (SELECT MAX(last_event_at) FROM sessions) t,",
+      // ❺ [第四轮复审 09:3x] 三项**内容指纹**：对**内容**取 md5，不再用 COUNT / SUM。
+      //   为什么换：第四轮复审指出两处「等量抵消」——
+      //     ① `nf` 只是 COUNT(files_mentioned 非空行数)，而 db.ts:663-668 的 refresh/confirm 是
+      //        `JSON.stringify(meta.files)` **整体重写**该列 ⇒ 删一个文件 + 同时加一个文件
+      //        ⇒ 行数不变、内容已变，而「最近在动」的聚合结果跟着变。
+      //     ② `ds` / `kq` 是 SUM(LENGTH(...)) ⇒ 等量增减归零（守护批量 recompute 时是常态）。
+      //   实测（库副本）：把 files_mentioned 里一个文件名换掉 ⇒ 旧七项**逐字不变**。
+      //   改法：`group_concat` 按 id 排序拼全文再取 md5 —— 顺序敏感、等长也区分。
+      //   实测主库 106KB 内容、6ms 完成，守门只跑两次，代价可忽略。
+      " (SELECT COUNT(*) FROM sessions WHERE files_mentioned IS NOT NULL AND files_mentioned != '[]') nf,",
+      " (SELECT COUNT(*) FROM sessions WHERE coalesce(message_count,0) <= 2",
+      "   AND (origin IS NULL OR origin NOT IN ('manual','imported','note'))",
+      "   AND (decisions IS NULL OR length(decisions) <= 2)",
+      "   AND (key_questions IS NULL OR length(key_questions) <= 2)) excl",
+    ].join(' ')
+    // 三项内容指纹单独取：需要逐行排序 + 哈希
+    const CONTENT_QUERIES = [
+      ['files', "SELECT group_concat(COALESCE(files_mentioned, char(39,39)), char(10)) v FROM (SELECT files_mentioned FROM sessions ORDER BY id)"],
+      ['dec', "SELECT group_concat(COALESCE(decisions, char(39,39)), char(10)) v FROM (SELECT decisions FROM sessions ORDER BY id)"],
+      ['kq', "SELECT group_concat(COALESCE(key_questions, char(39,39)), char(10)) v FROM (SELECT key_questions FROM sessions ORDER BY id)"],
+    ]
+    const stamp = async () => {
+      let db = null
+      try {
+        const { DatabaseSync } = await import('node:sqlite')
+        db = new DatabaseSync(path.join(r2, '.sessionrelay', 'relay.sqlite'), { readOnly: true })
+        const s = db.prepare(STAMP_SQL).get()
+        const { createHash } = await import('node:crypto')
+        const h = {}
+        for (const [k, q] of CONTENT_QUERIES) {
+          try { h[k] = createHash('md5').update(String(db.prepare(q).get().v ?? '')).digest('hex').slice(0, 10) } catch { h[k] = '?' }
+        }
+        return 'sessions=' + s.s + ' maxMsgRowid=' + s.m + ' lastEvent=' + s.t
+          + ' filesRows=' + s.nf + ' probeExcluded=' + s.excl
+          + ' filesMd5=' + h.files + ' decMd5=' + h.dec + ' kqMd5=' + h.kq
+      } catch (e) {
+        return 'n/a(' + String(e && e.message).slice(0, 40) + ')'
+      } finally { if (db) { try { db.close() } catch {} } }
+    }
+    // ❷ 窗口：st1 → 两路取数 → st2，两份被比较的快照**都在这个区间内取得**
+    // ❺ [第三轮复审 09:1x] 顺序调整：**先跑插件侧（~5ms），再跑 CLI（spawn ~190ms）**。
+    //   ⚠️⚠️ [第四轮复审 09:4x 勘误我自己] 这里原来写「时间差从 ~190ms 缩到 ~5ms」是**错的**。
+    //   实际：换顺序只是让**谁大谁小反了**（旧：插件 cutoff 比 CLI 晚；新：CLI 比插件晚），
+    //   **绝对差仍是 ~190ms**。不写成「缩到 5ms」，免得下一个人以为这里已经解决了。
+    //   原顺序是先 CLI 后插件，于是插件侧算 cutoff 的时刻比 CLI 晚 ~190ms。
+    //   库指纹此时**逐字相同**（守卫不会 SKIP），一个 `last_event_at` 正好落在这 190ms 缝里的会话
+    //   会被判成「两份实现已漂」—— **守卫把「库变了」和「钟走了」当成一回事**。
+    //   ⇒ 两手一起做：① 顺序改成快的在前，让时间差从 190ms 缩到 ~5ms；
+    //     ② 插件侧显式传 `now`（`queryRecentFiles` 新增的可选参数），让窗口可被外部钉住；
+    //     CLI 侧不改对外接口（那是产品 API，不该为一条测试加 flag）。
+    //   剩下的残余时间差（~5ms 量级）由 ❹ 的指纹继续兜：真有会话跨线，指纹会变并 SKIP。
+    const st1 = await stamp()
+    const nowFixed = Date.now()
+    let fromCli2 = null, fromPlug2 = null, readFail = ''
+    try { fromPlug2 = plug.queryRecentFiles(r2, { days: 7, top: 3, now: nowFixed }) } catch (e) { readFail = '插件二次取数失败 ' + String(e && e.message).slice(0, 40) }
+    try {
+      const out2 = execSync('"' + process.execPath + '" "' + cliPath + '" brief --json --limit 1', { cwd: r2, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+      fromCli2 = JSON.parse(out2).recentFiles
+    } catch (e) { readFail = (readFail || '') + 'CLI 二次取数失败 ' + String(e && e.message).slice(0, 40) }
+    const st2 = await stamp()
+    // ❸ 指纹取不到 ⇒ 判红并说清，**不再静默放行**（第一版这里是假绿的源头）
+    if (st1.startsWith('n/a(') || st2.startsWith('n/a(')) {
+      problems++
+      say('  🔴 ' + r2 + '：取库指纹失败（' + st1 + '），无法证明两次取数之间数据没变 —— **本节不下结论**')
+      say('       （不是「没问题」，是「没验成」。node:sqlite 不可用时第一版会一路绿，属静默假绿。）')
+      continue
+    }
+    if (readFail) { problems++; say('  🔴 ' + r2 + '：' + readFail + ' —— **本节不下结论**'); continue }
+    if (st1 !== st2) {
+      say('  ⚠️ ' + r2 + '：两次取数之间采集守护写库了（指纹 ' + st1 + ' → ' + st2 + '）——跳过本项目，不下结论')
+      continue
+    }
+    fromCli = fromCli2; fromPlug = fromPlug2
+    const same = JSON.stringify(fromCli2) === JSON.stringify(fromPlug)
     if (!same) problems++
-    say('  ' + (same ? '✅' : '🔴') + ' ' + r2 + ' → ' + JSON.stringify(fromCli) + (same ? '' : '\n       ≠ 插件 ' + JSON.stringify(fromPlug) + '\n       ← 两份实现已漂：DSH 与 ZCode 会显示不同的文件集合'))
+    say('  ' + (same ? '✅' : '🔴') + ' ' + r2 + ' → ' + JSON.stringify(fromCli2) + (same ? '' : '\n       ≠ 插件 ' + JSON.stringify(fromPlug) + '\n       ← 两份实现已漂：DSH 与 ZCode 会显示不同的文件集合'))
   }
 } catch (e) { say('  （对拍失败：' + String(e && e.message).slice(0, 90) + '）') }
 
@@ -475,7 +616,8 @@ say('')
 say('══════ L. 适配器能否拿到核心引擎（防静默降级）══════')
 try {
   const zcodeDir = path.join(HOME, '.zcode/hooks/statebrief')
-  const AD_FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs']
+  // engine.mjs 必须一起查：它是引擎解析的唯一入口，缺在部署副本里 = hook 静默降级（本条正是为防这个）
+  const AD_FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs', 'engine.mjs']
   if (!fs.existsSync(zcodeDir)) {
     say('  ⚪ 没装 ZCode 适配器（跳过）')
   } else {

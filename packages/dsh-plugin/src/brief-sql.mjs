@@ -66,6 +66,10 @@ function jsonArray(raw) {
 }
 
 /** 复刻 listDecisions + cmdDecisions 的 limit 语义（取最近 N 条，再倒序） */
+// 核心引擎（唯一判据来源）；拿不到就退化成"不折叠"，绝不自己抄判据
+let fold = null
+try { fold = await import('../vendor/dist/recall.js') } catch { fold = null }
+
 function queryDecisions(db, projectId, limit) {
   // [1015 夜 · 性能] 两处纯浪费，删掉**不改任何输出**（改前先量：主库 queryBriefData 17.1ms）：
   //   ① `topics` 被 SELECT 出来、被 JSON.parse、然后 `void topics` —— 一次都没用到；
@@ -84,6 +88,11 @@ function queryDecisions(db, projectId, limit) {
   const seenIdx = new Map()
   for (const r of rows) {
     for (const d of jsonArray(r.decisions)) {
+      // ── 1020 · P1：压缩卡片机制（压缩不掉召回）──
+      //   L3 压缩写回后，原始条目带 `compressed_into: <卡片id>`，同时库里追加了一条卡片。
+      //   **简报跳过带标记的**（否则同一件事显示两遍）；**检索路径不跳**（走 messages 全量）。
+      //   与核心 `core/SessionRelay/src/cli/brief.ts` 的 collectBrief 同一判据，改一处必须改另一处。
+      if (d.compressed_into) continue
       // [1015 修] 与核心库 dedupKey 同规：标点与表格竖线一并剔掉（只去空白会让"被表格符号切分"的
   // 同一句话算两条 → 简报双显）。改这里必须同时改 core/SessionRelay/src/store/db.ts 的 dedupKey。
   const key = String(d.text ?? '').replace(/[\s，。！？、,.!?;；:：|｜]+/g, '').slice(0, 40)
@@ -122,7 +131,24 @@ function queryDecisions(db, projectId, limit) {
     if (pa !== pb) return pa - pb
     return String(a.at ?? '').localeCompare(String(b.at ?? ''))
   })
+  // ⚠️ 本函数是**数据通道**，输出必须与 `srelay decisions --json` 逐字段一致（8b 断言就在比这个）：
+  // 呈现层折叠**不能在这里做**——一折叠就与 CLI 原始列表分叉，且会把置顶代表顶掉。
+  // 折叠统一在渲染出口做，见 foldPresentation()。
   return out.slice(-limit).reverse()
+}
+
+/**
+ * 呈现层折叠（ADR-003 D3）：近重复只在"这一次显示"里合成一条，存储一条不动。
+ * 判据调**核心那一份**（foldNearDuplicates：二元组重叠 + 长度比门 + 置顶优先），
+ * 本文件不另写判据；拿不到核心就原样返回（宁可重复显示，也不让会误杀的旧前缀键回来）。
+ * 与渲染同址：两条取数通道（直查 SQL / CLI 兜底）都经由 itemsFromArray 调它 ⇒ 渲染结果一致。
+ */
+export function foldPresentation(items) {
+  if (!fold || !Array.isArray(items) || items.length < 2) return items
+  try {
+    const { rows } = fold.foldNearDuplicates(items, 0.8, fold.lengthRatioGate, { prefer: (d) => d.pinned === true })
+    return rows
+  } catch { return items }
 }
 
 /** 复刻 listUnresolved(pid, 100) + cmdUnresolved 的保质期与截断顺序 */
@@ -209,7 +235,13 @@ export function queryBriefData(root, limit = 200) {
  *    全部数字见 docs/1015-深夜-最近在动-信号体检.md。
  * 绝不抛：这是 prompt 组装路径上的函数。返回 [] = 无数据/不可用。
  */
-export function queryRecentFiles(root, { days = 7, top = 3, maxSessions = 300 } = {}) {
+// ⚠️ [第三轮复审 09:1x] `now` 参数是给**对拍**用的：
+//   核心 CLI 与插件 SQL 两路各算各的 `Date.now()`，而 CLI 要 spawn 子进程（实测 ~190ms），
+//   两侧 cutoff 天然差这 190ms。库指纹此时**逐字相同**（守卫不会 SKIP），
+//   于是一个 `last_event_at` 正好落在缝里的会话会被判成「两份实现已漂」——
+//   守卫把「库变了」和「钟走了」当成一回事。
+//   ⇒ 传入**同一个** `now` 让两侧用同一瞬间算窗口；不传时行为与从前完全一致。
+export function queryRecentFiles(root, { days = 7, top = 3, maxSessions = 300, now = Date.now() } = {}) {
   if (!root || typeof root !== 'string') return []
   if (!DatabaseSync) return []
   const file = path.join(root, RELAY_DIR, DB_FILE)
@@ -217,7 +249,7 @@ export function queryRecentFiles(root, { days = 7, top = 3, maxSessions = 300 } 
   let db = null
   try {
     db = openDb(file)
-    const cutoff = new Date(Date.now() - days * 86400000).toISOString()
+    const cutoff = new Date(now - days * 86400000).toISOString()
     // [B3] 一次性探针会话（0~2 条消息、无决策无问题、非手动/导入）不进这个信号。
     // ⚠️ 这一段的判据与核心库 `core/SessionRelay/src/store/db.ts` 的 PROBE_SQL **同规**：
     //    两个运行时不能共用模块，所以守门 H 段拿真实库对拍两侧输出（改一边不改另一边会立刻变红）。

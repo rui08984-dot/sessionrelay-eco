@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { segment } from '../core/tokenize/tokenizer.js';
 import { loadConfig, claudeProjectsDir, zcodeDbPath } from '../shared/config.js';
 import { dbFile, findRelayRoot, ignoreFile } from '../shared/paths.js';
+import { ignoreFilePath } from '../capture/ignore.js';
 import { isDaemonAlive } from '../shared/lock.js';
 import { looksInjected } from '../core/extract/extract.js';
 import { EXTRACT_VERSION, extractVersionOf } from '../capture/recompute.js';
@@ -121,9 +122,16 @@ export async function cmdDoctor(): Promise<void> {
     } else {
       checks.push(c('relay.sqlite', 'warn', '不存在', 'srelay init'));
     }
-    checks.push(fs.existsSync(ignoreFile(root))
-      ? c('.sessionrelayignore', 'ok', '存在')
-      : c('.sessionrelayignore', 'warn', '不存在（无排除规则）'));
+    // [1021 审查 #07 连带] 排除文件路径必须走**唯一解析处**：用户可以在 config 里改 privacy.ignore_file，
+    // 这里若还写死 '.sessionrelayignore'，自定义文件存在时也会误报「不存在（无排除规则）」
+    // —— 和 #18「检查没覆盖被检查的东西」是同一种病。
+    {
+      const igPath = ignoreFilePath(root);
+      const igName = path.basename(igPath);
+      checks.push(fs.existsSync(igPath)
+        ? c(igName, 'ok', '存在')
+        : c(igName, 'warn', '不存在（无排除规则）'));
+    }
     const alive = isDaemonAlive(root);
     if (!alive.alive) {
       checks.push(c('守护进程', 'warn', '未运行', 'srelay watch --install-service 或 srelay sync 兜底'));
@@ -208,10 +216,17 @@ export async function cmdDoctor(): Promise<void> {
     const cfg = loadConfig(root);
     if (cfg.semantic?.enabled === true) {
       const { resolveTransformersEntry, semanticModelOf } = await import('../search-svc/semantic.js');
+      const { readSemanticStatus } = await import('../search-svc/semantic-status.js');
       const entry = resolveTransformersEntry();
-      checks.push(entry
-        ? c('语义检索', 'ok', `已启用（${semanticModelOf(cfg)}）`)
-        : c('语义检索', 'err', '已启用但 transformers.js 缺失（检索已自动降级纯字面）', 'npm i --prefix ~/.sessionrelay/semantic @huggingface/transformers@3'));
+      const rs = readSemanticStatus();
+      if (!entry) {
+        checks.push(c('语义检索', 'err', '已启用但 transformers.js 缺失（检索已自动降级纯字面）', 'npm i --prefix ~/.sessionrelay/semantic @huggingface/transformers@3'));
+      } else if (rs.state === 'failed') {
+        // [1017 夜] 静态依赖在、但**上一次真跑的时候装载失败了** —— 这条以前完全看不见
+        checks.push(c('语义检索', 'err', '已启用且依赖在，但上次装载失败（检索已降级纯字面）', '原因：' + String(rs.error).slice(0, 120) + ' · 详查 srelay semantic status'));
+      } else {
+        checks.push(c('语义检索', 'ok', `已启用（${semanticModelOf(cfg)}）` + (rs.state === 'ready' ? ' · 上次装载成功' : '')));
+      }
     } else {
       checks.push(c('语义检索', 'warn', '未启用（可选增强：换词查询也能命中，srelay semantic enable）'));
     }

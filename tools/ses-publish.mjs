@@ -102,8 +102,17 @@ const PLANS = [
   ['core/SessionRelay', 'packages/core', '核心库 SessionRelay（采集/提取/检索/归档/MCP）'],
   ['plugins/dsh', 'packages/dsh-plugin', 'DSH 插件（把项目记忆注入 system prompt）'],
   ['integrations/zcode', 'packages/zcode-adapter', 'ZCode 适配器（SessionStart 开场简报）'],
+  // [1021] Codex 适配器：与 ZCode 共用 brief-shared 同一份简报逻辑，只是配置面与 trust 步骤不同。
+  //   发布树必须带它 —— 否则别人永远拿不到第三端（和当初面板的"本机能跑、别人拿不到"同型盲区）。
+  ['integrations/codex', 'packages/codex-adapter', 'Codex 适配器（SessionStart 简报 + MCP + 技能）'],
   ['integrations/skills/handoff-atlas', 'skills/handoff-atlas', '交接与全资源地图技能'],
 ];
+
+// [1021] Codex 适配器在仓库里靠 ../zcode 拿共享简报模块（brief-shared/filters/turn/engine）。
+// 但发布树里 packages/codex-adapter 的兄弟目录叫 zcode-adapter，路径对不上 ——
+// install.mjs 有 HERE 回退，所以这里必须把这几个 .mjs **平铺**复制进 codex-adapter。
+// 不加这一步的后果：下载包装完 hook 直接 ERR_MODULE_NOT_FOUND（ZCode 侧踩过一次的同型坑）。
+const CODEX_SHARED = ['brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs', 'engine.mjs'];
 for (const [src, dst, desc] of PLANS) {
   const before = stats.files;
   copyTree(path.join(ROOT, src), path.join(OUT, dst), stats);
@@ -131,12 +140,30 @@ copyTree(path.join(ROOT, 'publish'), OUT, stats);
 ok('仓库门面（README / INSTALL / LICENSE / docs / release）');
 
 // ── 4) 发布前自检 ─────────────────────────────────────────────────────────
+
+// Codex 适配器的共享依赖平铺（见上面 CODEX_SHARED 的说明）
+try {
+  const zcSrc = path.join(ROOT, 'integrations', 'zcode');
+  const cxDst = path.join(OUT, 'packages', 'codex-adapter');
+  if (fs.existsSync(cxDst)) {
+    let n = 0;
+    for (const f of CODEX_SHARED) {
+      const from = path.join(zcSrc, f);
+      if (!fs.existsSync(from)) { say('  🔴 codex 共享依赖缺失: ' + f); continue; }
+      fs.copyFileSync(from, path.join(cxDst, f));
+      n++;
+    }
+    say('  ✅ codex-adapter 共享依赖 ' + n + '/' + CODEX_SHARED.length + ' 已平铺');
+  }
+} catch (e) { say('  🔴 codex 依赖复制失败: ' + String(e && e.message || e).slice(0, 100)); }
+
 say('\n══ 发布前自检 ══');
 const CHECK = [
   'README.md', 'README.en.md', 'INSTALL.md', 'LICENSE', '.gitignore',
   'packages/core/package.json', 'packages/core/src/bin/srelay.ts',
   'packages/dsh-plugin/index.js', 'packages/dsh-plugin/package.json',
   'packages/zcode-adapter/brief.mjs', 'packages/zcode-adapter/install.mjs',
+  'packages/codex-adapter/brief.mjs', 'packages/codex-adapter/install.mjs',
   'skills/handoff-atlas/SKILL.md', 'skills/handoff-atlas/scripts/anchor_audit.mjs',
   'tools/ses-install.mjs', 'tools/check-versions.mjs',
 ];

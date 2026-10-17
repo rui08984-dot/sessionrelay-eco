@@ -56,7 +56,7 @@ program
 
 program
   .command('forget [id]')
-  .description('彻底遗忘：整条会话（含决策）从本库消失，永不复活（空间老化用 archive，彻底消失用 forget）')
+  .description('彻底遗忘：整条会话（含决策）从本库消失、永不复活。省空间用 archive，彻底消失才用它')
   .option('--session <id>', '限定捕获会话（防误删笔记）')
   .option('--note <id>', '限定笔记')
   .option('--all', '整库重置（需 --confirm <projectId>，守护运行中拒绝）')
@@ -69,12 +69,25 @@ program
 
 program
   .command('semantic')
-  .description('语义检索（可选）：换一种说法也能命中历史会话——本地 CPU 推理，显式启用')
+  .description('语义检索（可选，实测无召回提升且检索慢一倍，默认关；纯字面匹配已够用）')
   .option('--enable', '启用：安装依赖（用户缓存目录）+ 模型就绪 + 存量回填')
   .option('--disable', '停用（向量数据保留，检索立即回退纯字面匹配）')
   .option('--status', '状态（默认）')
   .option('--test <query>', '对比模式：FTS-only vs 融合命中')
+  .option('--backfill', '只补嵌存量会话（已启用时用；不改开关、不装依赖）')
+  .option('--reembed', '把已有向量作废重算（换了嵌入口径后必须走它，否则旧向量会一直骗人）')
   .action(async (f) => { const { cmdSemantic } = await import('../cli/semantic.js'); await cmdSemantic(f); });
+
+program
+  .command('compress')
+  .description('模型压缩：把旧决策合成上级条目。默认关、原文永不删、可审计可回滚')
+  .option('--dry-run', '看它会合并什么（不调模型、不写库）')
+  .option('--apply', '真跑：调模型 + 写审计（原文快照进 compress_detail）')
+  .option('--write-back', '配 --apply：把合并结果写回数据（原文只加 compressed_into 标记，不删不改；简报跳过、检索照旧）')
+  .option('--logs', '看历史合并记录')
+  .option('--rollback <id>', '列出某次合并的回滚依据（不改库）')
+  .option('--json', '机器格式')
+  .action(async (f) => { const { cmdCompress } = await import('../cli/compress.js'); await cmdCompress(f); });
 
 program
   .command('status')
@@ -244,6 +257,46 @@ program
   .action(async (opts) => {
     const { cmdBenchExtract } = await import('../cli/bench.js');
     await cmdBenchExtract({ ...opts, limit: opts.limit ? Number(opts.limit) : undefined });
+  });
+
+program
+  .command('lifecycle')
+  .description('记忆生命周期（内核原生）：体检→自愈→采集→重算→经验→去重→清洗→老化→分发')
+  .option('--status', '只看各阶段状态（不跑）')
+  .option('--once', '只跑一轮（默认行为，写出来是为了可读）')
+  .option('--loop <sec>', '常驻：每 N 秒一轮（0 = 只跑一轮）')
+  .option('--only <ids>', '只跑这些阶段（逗号分隔：guard,repair,capture,extract,consolidate,compact,cleanup,aging,distribute）')
+  .option('--light', '只跑轻阶段（宿主内 worker 用，不阻塞 UI）')
+  .option('--force', '无视各阶段节奏，强制全跑')
+  .option('--json', '机器格式')
+  .action(async (opts) => {
+    const { runLifecycle, lifecycleStatus } = await import('../core/lifecycle/runner.js');
+    const only = typeof opts.only === 'string' && opts.only
+      ? String(opts.only).split(',').map((s: string) => s.trim()).filter(Boolean) as never[]
+      : undefined;
+    if (opts.status) {
+      const st = lifecycleStatus();
+      if (opts.json) { console.log(JSON.stringify(st, null, 2)); return; }
+      console.log('生命周期状态：已跑 ' + st.rounds + ' 轮' + (st.lastAt ? ' · 最近 ' + st.lastAt : ''));
+      for (const [id, s] of Object.entries(st.stages)) {
+        const v = s as { ok: boolean; note: string; at: string } | undefined;
+        if (!v) continue;
+        console.log('  ' + (v.ok ? '✅' : '🔴') + ' ' + id + '：' + String(v.note).slice(0, 90) + '（' + v.at.slice(11, 19) + '）');
+      }
+      return;
+    }
+    const loop = opts.loop != null ? Math.max(0, Number(opts.loop)) : 0;
+    const once = async () => {
+      const r = await runLifecycle({ only, force: !!opts.force, lightOnly: !!opts.light, log: opts.json ? () => {} : (l: string) => console.log(l) });
+      if (opts.json) console.log(JSON.stringify(r, null, 2));
+      // 有阶段失败时用退出码表达（守护/CI 能抓到），但**不中断**下一轮
+      return r.stages.some((s) => !s.ok && !s.skipped);
+    };
+    if (!loop) { if (await once()) process.exitCode = 1; return; }
+    for (;;) {
+      await once();
+      await new Promise((r) => setTimeout(r, loop * 1000));
+    }
   });
 
 program

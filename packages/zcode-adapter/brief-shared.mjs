@@ -10,6 +10,17 @@ import { execFileSync } from 'node:child_process';
 // 历史上两侧手抄导致过滤器漂移（DSH 多一条而这里没有，而用户日常在 ZCode 侧干活）。
 // 改过滤器只能改那一份，然后同步到这里；tools/check-brief-filters.mjs 会抓不同步。
 import { passesBriefFilters, passesUnresolvedFilters } from './brief-filters.mjs';
+// [1017] 呈现层折叠要调**核心那一份**判据（与 DSH 侧 index.js 同源，铁律 1：判据只许有一份）。
+// 引擎解析交给 engine.mjs（唯一解析点）；拿不到 ⇒ 不折叠（宁可重复显示，也不让已知会误杀的旧前缀键回来）。
+import { loadEngine } from './engine.mjs';
+const __engine = await loadEngine();
+function foldItems(items) {
+  const core = __engine && __engine.mod;
+  if (!core || typeof core.foldNearDuplicates !== 'function' || !Array.isArray(items) || items.length < 2) return items;
+  try {
+    return core.foldNearDuplicates(items, 0.8, core.lengthRatioGate, { prefer: (d) => d.pinned === true }).rows;
+  } catch { return items; }
+}
 
 export const FRESH_DECISIONS_MS = 48 * 3600_000;
 export const FRESH_UNRESOLVED_MS = 48 * 3600_000;
@@ -18,7 +29,24 @@ export const MAX_TOTAL = 1500;
 // 语义的两份实现（不同运行时，无法共用模块），历史上"新鲜度窗/碎片过滤/按段装填"
 // 各分叉过一次。改名必须两边一起改，否则两条客户端给出的记忆不一样。
 export const DEC_SLOTS = 4;
-export const UNR_SLOTS = 3;
+// [1017 夜 U-A 降级] UNR_SLOTS 3 → 1。依据 docs/research/2026-10-18-U-A未决段处置调研.md：
+//   实测注入了 3 条，其中 2 条是残片（precision ≈ 1/3），而且 3 条**全部来自同一个老会话**
+//   （该会话 7 条"未决"其后各有 305~524 条 assistant 消息 ⇒ 早被答过，"未决"与"未答"不相关）。
+//   名额从 3 降到 1 是**降级**不是终态：配 7 天 precision 门禁，仍 <50% 就转"砍掉不渲染"。
+//   反悔很简单 —— 把数字改回 3（**改内核 recall 那一处**，三运行时一起生效）。
+//
+// [1017 夜 12d 归核] 这里原来是自己写的 `export const UNR_SLOTS = 1`（第三份副本）。
+//   判据收进内核 dist/recall.js 后改为转发权威值，物理消灭第三份。
+//   brief-filters.mjs 拿不到引擎时退回 1（只影响「无内核」的裸装场景）。
+export { UNR_SLOTS } from './brief-filters.mjs';
+// ⚠️ [1021 修] **`export { X } from '...'` 只是「转出口」，不会创建本地绑定。**
+//   本文件第 318 行 `slice(0, UNR_SLOTS)` 用的是**本地**引用，而它从 1017 夜那次「归核」起
+//   就一直没被 import 过 ⇒ 每次执行到这里都抛 `ReferenceError: UNR_SLOTS is not defined`。
+//   而 brief.mjs 的契约是「任何失败=空输出」（hook 规范要求不阻塞会话），于是
+//   这个 ReferenceError 被彻底吞掉 —— **ZCode 侧的自动简报从那天起一条都没注入过**。
+//   发现方式：`SRELAY_BRIEF_DEBUG=1` 跑一次才看见 stderr 里的这行。
+import { UNR_SLOTS as UNR_SLOTS_LOCAL } from './brief-filters.mjs';
+const UNR_SLOTS = UNR_SLOTS_LOCAL;
 // 看板单行字符上限。实测（D:\agent1super）：progress.md 的明细列动辄 600+ 字符，
 // 两行就占掉简报 91% 的预算（1313/1438），而真正的记忆内容——决策与未决——只拿到 5%。
 // 看板是 progress.md 状态栈的东西，不是 SessionRelay 的记忆；它不该把 SES 唯一的
@@ -147,6 +175,10 @@ function jsonItems(raw, key, max, maxAgeMs) {
     // 整条通道会被静默清空（1015 实测：主库 43 条未决全被 length<5 拦掉）。
     const textOf = (d) => String(d.text ?? d.summary ?? d.q ?? d.title ?? '');
     const fresh = arr
+      // ── 1020 · P1：压缩卡片机制（压缩不掉召回）──
+      //   L3 压缩写回后原始条目带 `compressed_into`，同时追加了卡片。
+      //   **简报跳过带标记的**，**检索不跳**。与核心 collectBrief / DSH brief-sql 同一判据。
+      .filter((d) => !d.compressed_into)
       // 碎片过滤：施工会话碎片出现在 title 或 text（title 干净、text 半句的组合实测存在）
       .filter((d) => !/workflow subagent|actor#\d+/i.test(String(d.title ?? '') + ' ' + textOf(d)))
       // 粘包过滤：多条消息拼进一条记录（"？,-"接缝）= 采集伪影，决策/未解决两通道都拦
@@ -190,18 +222,11 @@ function jsonItems(raw, key, max, maxAgeMs) {
       if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
       return (Date.parse(b.at ?? b.msgAt ?? '') || 0) - (Date.parse(a.at ?? a.msgAt ?? '') || 0);
     });
-    // [fork 1015] 近重复合并（只在显示层，不动存储/检索）——与 DSH 侧 index.js 同规。
-    // 病历：同一个决策被两个会话各写一句摘要，40 字去重键与二元组相似度都抓不住
-    // （"语义相同、字面不同"）。改用**前 14 字前缀键**：实测 music 合并 3 组 7 条
-    // （逐条读过，全是同一决策的不同写法），agent1super 合并 0 条。置顶条目豁免。
-    const seenPref = new Set();
-    const deduped = fresh.filter((d) => {
-      if (d.pinned === true) return true;
-      const k = textOf(d).replace(/[\s，。！？、,.!?;；:：|｜`"']+/g, '').slice(0, 14);
-      if (!k || seenPref.has(k)) return false;
-      seenPref.add(k);
-      return true;
-    });
+    // [1017] 近重复合并（只在显示层，不动存储/检索）——判据换成**核心那一份**：
+    // foldNearDuplicates（二元组重叠 + 长度比门 + 置顶优先），取代原先自建的"前 14 字前缀键"。
+    // 病历：前缀键误杀过干净决策「采用 Vite 作为前端构建工具」，留下 62 字粘连噪声（长度比 3.88）。
+    // 与 DSH 侧同源 ⇒ 两侧简报不会再因为各写一套判据而分叉。
+    const deduped = foldItems(fresh);
     return deduped
       .slice(0, max)
       // 字段链按各 API 真实 schema：decisions={text}, unresolved={q}——缺 q 曾静默显示会话标题
@@ -270,6 +295,13 @@ function fetchBriefFeed(srelay, dbg) {
 }
 
 /** 组装简报正文（看板必留，决策/未解决按剩余预算装填）。返回 null = 内容过短不值得注入 */
+// [1017 夜 10:0x] 仅供守门/自测用的钩子：把过滤链暴露出来，好让「两侧链条行为一致」能被**真跑**验。
+// 为什么需要它：守门 §⑧ 的十条文本探针**全绿**于「把某一层 filter 挪走」这种漂移
+//（判据名在文件别处仍在场，文本探针分辨不出「用没用」）。实测 10/10 条探针全部放过。
+// 而 1015 那次真实漂移恰恰就是这一类（DSH 多一条而 ZCode 没有），
+// 所以这条链必须有**行为级**断言，不能只靠文本探针。
+export const __testFilterChain = jsonItems
+
 export function buildBrief(root, { srelay, dbg }) {
   const parts = [`📍 项目状态简报（自动注入，出处可信；注入≠强制续作——你下一句话才是指令；说"继续"按此续作）`];
   const kb = kanbanLines(root, dbg);

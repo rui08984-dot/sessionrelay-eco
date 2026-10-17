@@ -149,6 +149,46 @@ CREATE TABLE IF NOT EXISTS cleanup_detail (
 CREATE INDEX IF NOT EXISTS idx_cleanup_detail_log ON cleanup_detail(cleanup_log_id);
 CREATE INDEX IF NOT EXISTS idx_cleanup_detail_session ON cleanup_detail(session_id);
 
+-- ═══════════ L3 模型压缩（docs/1018-夜-模型压缩与语义档-建设方案.md §2） ═══════════
+-- 边界③「可审计 + 可回滚」与边界④「配额落库」的落点。
+-- 形态刻意抄 cleanup_log/cleanup_detail（同一个项目里两种审计形态 = 迟早有人只查一种）。
+-- ⚠️ compress_detail 里存的是**合并前的原文快照**（text 全量），这样回滚不需要去猜。
+CREATE TABLE IF NOT EXISTS compress_log (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  triggered_by      TEXT NOT NULL,
+  scope             TEXT NOT NULL,
+  model             TEXT NOT NULL,
+  provider          TEXT NOT NULL,
+  clusters_seen     INTEGER NOT NULL DEFAULT 0,
+  clusters_merged   INTEGER NOT NULL DEFAULT 0,
+  items_in          INTEGER NOT NULL DEFAULT 0,
+  items_out         INTEGER NOT NULL DEFAULT 0,
+  discarded         INTEGER NOT NULL DEFAULT 0,
+  calls             INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL DEFAULT 'applied',
+  rolled_back_at    TEXT,
+  note              TEXT,
+  created_at        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compress_detail (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  compress_log_id   INTEGER NOT NULL REFERENCES compress_log(id) ON DELETE CASCADE,
+  session_id        TEXT,
+  lesson_id         INTEGER,
+  merged_text       TEXT NOT NULL,
+  evidence_ids      TEXT NOT NULL,
+  originals         TEXT NOT NULL,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compress_detail_log ON compress_detail(compress_log_id);
+
+-- 配额**落库**（边界④：重启不重置）。按小时窗口计数。
+CREATE TABLE IF NOT EXISTS compress_quota (
+  key       TEXT PRIMARY KEY,
+  used      INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
 -- ═══════════ v3：遗忘（srelay forget，设计 v4 §3.2/§3.4） ═══════════
 -- 墓碑：防复活次级防线（主防线是 .sessionrelayignore 的 session: 规则，跨 rebuild 存活；
 -- 墓碑随库走，rebuild 后消失——故只是 ignore 被用户清理后的兜底）
@@ -486,14 +526,95 @@ export function getMessageRange(db: DB, sessionId: string, fromSeq: number, toSe
   return db.prepare('SELECT role, content, seq_num, created_at FROM messages WHERE session_id = ? AND seq_num >= ? AND seq_num <= ? ORDER BY seq_num').all(sessionId, fromSeq, toSeq) as Array<{ role: string; content: string; seq_num: number; created_at: string | null }>;
 }
 
+// ═══════════ 出处回跳（[1021 红队 R13] msgId 优先 / seq 回落 / 回落留痕）═══════════
+//
+// 病历：v22 给决策/未决条目加了 `msgId`（= `messages.id`，稳定主键）治「序号漂移」，
+//   但**读路径一个都没消费它**（grep 全仓只有 extract.ts 两处写入 + version.ts 注释）。
+//   而 `seq` 是位置索引，消息被裁剪/归档后整体前移 ⇒ 用户照着 CLI 打出来的
+//   `--range N:N` 回查，会指到**错的那条**或空结果，且不报错。
+//
+// 这里的约定（三个读路径 cli/meta.ts · mcp/server.ts · relay/export.ts 共用）：
+//   ① 有 msgId → 按 id 查（稳定）；
+//   ② **没有 msgId 才回落 seq**；回落要能被统计（via 字段），不许静默；
+//   ③ 有 msgId 但查不到（原文已归档）→ via='none'，**不再拿 seq 猜**——猜了就是漂移本身。
+
+export interface MessageRef {
+  /** msgId = 稳定主键命中；seq = 回落（该条目没有 msgId，序号漂移时会指错）；none = 两路都不中（原文已归档） */
+  via: 'msgId' | 'seq' | 'none';
+  /** 命中的消息（via='none' 时缺省） */
+  message?: { id: string | number; seq_num: number; role: string; createdAt: string | null };
+}
+
+/** 出处回跳的唯一收口。见上方约定。 */
+export function resolveMessageRef(
+  db: DB, sessionId: string,
+  ref: { msgId?: string | number | null; seq?: number | null },
+): MessageRef {
+  const raw = ref.msgId;
+  if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
+    // messages.id 是 INTEGER：数字串按数字比（SQLite 亲和性本就如此，这里显式化避免依赖隐式转换）
+    const key: string | number = typeof raw === 'number' ? raw : (/^\d+$/.test(String(raw).trim()) ? Number(String(raw).trim()) : String(raw).trim());
+    const m = db.prepare('SELECT id, seq_num, role, created_at FROM messages WHERE session_id = ? AND id = ?')
+      .get(sessionId, key) as { id: string | number; seq_num: number; role: string; created_at: string | null } | undefined;
+    // 有 msgId 但查不到 = 原文已被归档/裁剪。**刻意不回落 seq**：那条路正是"指到错的那条"的来源。
+    return m ? { via: 'msgId', message: { id: m.id, seq_num: m.seq_num, role: m.role, createdAt: m.created_at } } : { via: 'none' };
+  }
+  const seq = ref.seq;
+  if (seq !== undefined && seq !== null && Number.isFinite(Number(seq))) {
+    const m = db.prepare('SELECT id, seq_num, role, created_at FROM messages WHERE session_id = ? AND seq_num = ?')
+      .get(sessionId, Number(seq)) as { id: string | number; seq_num: number; role: string; created_at: string | null } | undefined;
+    return m ? { via: 'seq', message: { id: m.id, seq_num: m.seq_num, role: m.role, createdAt: m.created_at } } : { via: 'none' };
+  }
+  return { via: 'none' };
+}
+
+/** 按稳定主键取一条消息全文（MCP srelay_show 的 message_id 回查用）。 */
+export function getMessageById(
+  db: DB, sessionId: string, msgId: string | number,
+): { id: string | number; seq_num: number; role: string; content: string; created_at: string | null } | undefined {
+  const key: string | number = typeof msgId === 'number' ? msgId : (/^\d+$/.test(String(msgId).trim()) ? Number(String(msgId).trim()) : String(msgId).trim());
+  return db.prepare('SELECT id, seq_num, role, content, created_at FROM messages WHERE session_id = ? AND id = ?')
+    .get(sessionId, key) as { id: string | number; seq_num: number; role: string; content: string; created_at: string | null } | undefined;
+}
+
+export interface MsgIdCoverage {
+  decisions: { total: number; withMsgId: number };
+  questions: { total: number; withMsgId: number };
+  /** 未决（questions 里 unresolved=true 的那些）——简报/CLI 真正会回跳的子集 */
+  unresolved: { total: number; withMsgId: number };
+}
+
+/** 量"msgId 覆盖率"：**修 R13 之前必须先跑它**，否则会把"读端已修"说成"漂移已根治"。
+ *  本机实测（2026-10-17，622 场 / 831 条决策 / 806 条问题）：withMsgId = 0 ——
+ *  因为真正跑过的两条写路径（recompute / judge 增量）SELECT 里没带 `id`，msgId 从来没被写进库。 */
+export function msgIdCoverage(db: DB, projectId: string): MsgIdCoverage {
+  const rows = db.prepare('SELECT decisions, key_questions FROM sessions WHERE project_id = ?').all(projectId) as Array<{ decisions: string | null; key_questions: string | null }>;
+  const out: MsgIdCoverage = { decisions: { total: 0, withMsgId: 0 }, questions: { total: 0, withMsgId: 0 }, unresolved: { total: 0, withMsgId: 0 } };
+  const has = (o: unknown): boolean => {
+    const v = (o as { msgId?: unknown } | null)?.msgId;
+    return v !== undefined && v !== null && String(v).trim() !== '';
+  };
+  for (const r of rows) {
+    let decs: unknown[] = []; let qs: unknown[] = [];
+    try { decs = JSON.parse(r.decisions ?? '[]'); } catch { decs = []; }
+    try { qs = JSON.parse(r.key_questions ?? '[]'); } catch { qs = []; }
+    for (const d of Array.isArray(decs) ? decs : []) { out.decisions.total++; if (has(d)) out.decisions.withMsgId++; }
+    for (const q of Array.isArray(qs) ? qs : []) {
+      out.questions.total++; if (has(q)) out.questions.withMsgId++;
+      if ((q as { unresolved?: boolean } | null)?.unresolved) { out.unresolved.total++; if (has(q)) out.unresolved.withMsgId++; }
+    }
+  }
+  return out;
+}
+
 // ───────────────────── Phase 2：confirmed 副作用与元数据查询 ─────────────────────
 
 import { extractMessages, extractDecisions, extractQuestions, extractTopics, summaryRule, sanitizeMsgs, type Msg, type ExtractedMeta } from '../core/extract/extract.js';
 
 export function getSessionMessages(db: DB, sessionId: string): Msg[] {
-  return (db.prepare('SELECT role, content, seq_num, created_at FROM messages WHERE session_id = ? ORDER BY seq_num')
-    .all(sessionId) as Array<{ role: string; content: string; seq_num: number; created_at: string | null }>)
-    .map((r) => ({ role: r.role === 'user' ? 'user' : 'assistant', content: r.content, seqNum: r.seq_num, createdAt: r.created_at }));
+  return (db.prepare('SELECT id, role, content, seq_num, created_at FROM messages WHERE session_id = ? ORDER BY seq_num')
+    .all(sessionId) as Array<{ id: string; role: string; content: string; seq_num: number; created_at: string | null }>)
+    .map((r) => ({ id: r.id, role: r.role === 'user' ? 'user' : 'assistant', content: r.content, seqNum: r.seq_num, createdAt: r.created_at }));
 }
 
 /** confirmed 统一入口（judge 与 srelay confirm 共用）：提取元数据 + summary_rule + meta_text 重算 */
@@ -532,7 +653,9 @@ export function refreshDecisionsIncremental(db: DB, id: string): boolean {
   let existing: Array<{ text: string; seq: number; at?: string }> = [];
   try { existing = JSON.parse((db.prepare('SELECT decisions FROM sessions WHERE id = ?').get(id) as { decisions?: string } | undefined)?.decisions ?? '[]'); } catch { existing = []; }
   const lastSeq = existing.reduce((m, d) => Math.max(m, d.seq ?? 0), 0);
-  const msgs = (db.prepare('SELECT role, content, seq_num AS seqNum, created_at AS createdAt FROM messages WHERE session_id = ? AND seq_num > ? ORDER BY seq_num')
+  // [1021 红队 R13] SELECT 必须带 id：这条（judge 增量，最高频的写路径）原来不带，
+  //   于是 extractDecisions 拿到的 m.id 是 undefined，msgId 从来没被写进库（实测覆盖率 0%）。
+  const msgs = (db.prepare('SELECT id, role, content, seq_num AS seqNum, created_at AS createdAt FROM messages WHERE session_id = ? AND seq_num > ? ORDER BY seq_num')
     .all(id, lastSeq) as Msg[]).map((m) => ({ ...m, role: m.role === 'user' ? 'user' as const : 'assistant' as const }));
   // ⚠️ 必须走 extractForWrite：这里曾直接调 extractDecisions(msgs)，没过 sanitizeMsgs，
   // 技能目录垃圾从最高频的 pending 路径原样写回库（红队 1014 🔴）。且本路径每闲置
@@ -646,6 +769,9 @@ export function applyExtraction(db: DB, id: string, meta: ExtractedMeta, summary
 export interface DecisionRow {
   at: string; source: string; sessionId: string; title: string | null;
   text: string; seq: number; msgAt?: string; pinned?: boolean;
+  /** [v22 / 1021 红队 R13] 消息稳定主键（= `messages.id`）：**出处回跳优先用它**。
+   *  存量条目（v22 之前抽的）没有这个字段，读取端会回落 seq 并留痕（见 resolveMessageRef）。 */
+  msgId?: string | number;
   /** ADR-001：这条决策是否编码"否掉一条路"。缺省视为 'decision'（存量数据无此字段）。 */
   kind?: 'decision' | 'negative';
 }
@@ -654,7 +780,10 @@ export function listDecisions(db: DB, projectId: string, filter?: { topic?: stri
   // [fork 0924b] 不再过滤 state='confirmed'——长活会话（一直 active）的决策也要可见，
   // 否则决策列再新鲜也进不了简报（mc整合包 0924 实测：791 条消息的活跃会话 9 条决策不可见）。
   // 未确认会话的"半成品"风险由抽取守卫+origin 排除+简报 48h 窗三层兜住。
-  const conds = ['project_id = ?', 'decisions IS NOT NULL', "(origin IS NULL OR origin != 'workflow')"];
+  // [1021 审查 #12] 隔离会话的决策**不得**进入正常已确认结论视图。
+  //   隔离导入只拦了正文，没拦 decisions —— 于是包里的不可信决策仍能被 listDecisions 返回。
+  //   现在按 state 排除：quarantine 的内容要经 release_quarantine 放行后才算数。
+  const conds = ['project_id = ?', 'decisions IS NOT NULL', "(origin IS NULL OR origin != 'workflow')", "COALESCE(state, '') != 'quarantine'"];
   const params: unknown[] = [projectId];
   if (filter?.source) { conds.push('source = ?'); params.push(filter.source); }
   // ADR-001：按 kind 过滤。SQL 层用 JSON 函数不可靠（不同 Node/SQLite 版本的 json_each
@@ -672,7 +801,7 @@ export function listDecisions(db: DB, projectId: string, filter?: { topic?: stri
   // key → { idx: 已入队条目下标（-1 = 被 --kind 过滤掉了）, atMs, pinned }
   const seen = new Map<string, { idx: number; atMs: number; pinned: boolean }>();
   for (const r of rows) {
-    let decs: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative' }> = [];
+    let decs: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative'; msgId?: string | number }> = [];
     let topics: string[] = [];
     try { decs = JSON.parse(r.decisions); topics = JSON.parse(r.topics ?? '[]'); } catch { continue; }
     if (filter?.topic && !topics.includes(filter.topic) && !r.title?.includes(filter.topic)) continue;
@@ -699,7 +828,7 @@ export function listDecisions(db: DB, projectId: string, filter?: { topic?: stri
         if (atMs <= prev.atMs) continue;
         prev.atMs = atMs;
         if (prev.idx < 0) continue;   // 之前被 --kind 过滤掉：保持"整键不上"，不因时间更新而复活
-        const row: DecisionRow = { at, source: r.source, sessionId: r.id, title: r.title, text: d.text, seq: d.seq, msgAt: d.at, pinned: prev.pinned || d.pinned === true, kind: d.kind === 'negative' ? 'negative' : 'decision' };
+        const row: DecisionRow = { at, source: r.source, sessionId: r.id, title: r.title, text: d.text, seq: d.seq, msgId: d.msgId, msgAt: d.at, pinned: prev.pinned || d.pinned === true, kind: d.kind === 'negative' ? 'negative' : 'decision' };
         // [1015 夜 · 红队 A#2 修复] 覆写前**必须重判 --kind**：
         //   原先直接 out[prev.idx] = row ⇒ `decisions --kind decision` 可能返回 kind='negative' 的行
         //   （构造复现：同键两条，先到的 kind=decision、后到的 kind=negative 且时间更新）。
@@ -710,7 +839,7 @@ export function listDecisions(db: DB, projectId: string, filter?: { topic?: stri
         out[prev.idx] = row;
         continue;
       }
-      const row: DecisionRow = { at, source: r.source, sessionId: r.id, title: r.title, text: d.text, seq: d.seq, msgAt: d.at, pinned: d.pinned === true, kind: d.kind === 'negative' ? 'negative' : 'decision' };
+      const row: DecisionRow = { at, source: r.source, sessionId: r.id, title: r.title, text: d.text, seq: d.seq, msgId: d.msgId, msgAt: d.at, pinned: d.pinned === true, kind: d.kind === 'negative' ? 'negative' : 'decision' };
       if (wantKind && row.kind !== wantKind) { seen.set(key, { idx: -1, atMs, pinned: row.pinned === true }); continue; }
       seen.set(key, { idx: out.length, atMs, pinned: row.pinned === true });
       out.push(row);
@@ -768,24 +897,28 @@ export function setDecisionPinned(db: DB, projectId: string, fragment: string, p
   return changed;
 }
 
-export interface UnresolvedRow { q: string; at: string; source: string; sessionId: string; title: string | null }
+export interface UnresolvedRow {
+  q: string; at: string; source: string; sessionId: string; title: string | null;
+  /** [R13] 消息稳定主键；存量条目没有 → 读取端回落 seq 并留痕 */
+  msgId?: string | number;
+}
 
 export function listUnresolved(db: DB, projectId: string, limit = 20): UnresolvedRow[] {
   // [fork 0924] 同步排除 workflow 施工会话（与 listDecisions 同规，问题 4 的垃圾同源）
-  const rows = db.prepare(`SELECT id, source, title, created_at, key_questions FROM sessions WHERE project_id = ? AND key_questions IS NOT NULL AND (origin IS NULL OR origin != 'workflow') ORDER BY created_at DESC`).all(projectId) as Array<{
+  const rows = db.prepare(`SELECT id, source, title, created_at, key_questions FROM sessions WHERE project_id = ? AND key_questions IS NOT NULL AND (origin IS NULL OR origin != 'workflow') AND COALESCE(state, '') != 'quarantine' ORDER BY created_at DESC`).all(projectId) as Array<{
     id: string; source: string; title: string | null; created_at: string; key_questions: string;
   }>;
   const out: UnresolvedRow[] = [];
   const seenQ = new Set<string>();
   for (const r of rows) {
-    let qs: Array<{ q: string; at?: string; unresolved: boolean }> = [];
+    let qs: Array<{ q: string; at?: string; unresolved: boolean; msgId?: string | number }> = [];
     try { qs = JSON.parse(r.key_questions); } catch { continue; }
     for (const q of qs.filter((x) => x.unresolved)) {
       // [fork 0924] 同一问题在多个会话被捕获时去重（简报曾同条双显）
       const key = dedupKey(q.q);
       if (key && seenQ.has(key)) continue;
       if (key) seenQ.add(key);
-      out.push({ q: q.q, at: q.at ?? r.created_at, source: r.source, sessionId: r.id, title: r.title });
+      out.push({ q: q.q, at: q.at ?? r.created_at, source: r.source, sessionId: r.id, title: r.title, msgId: q.msgId });
     }
   }
   return out.slice(0, limit);
@@ -855,8 +988,8 @@ export interface SessionFull {
   id: string; source: string; sourceSessionId: string; projectId: string; origin: string;
   state: string; title: string | null; createdAt: string; lastEventAt: string | null;
   messageCount: number; files: string[]; topics: string[];
-  decisions: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative' }>;
-  questions: Array<{ q: string; seq: number; at?: string; unresolved: boolean }>;
+  decisions: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative'; msgId?: string | number }>;
+  questions: Array<{ q: string; seq: number; at?: string; unresolved: boolean; msgId?: string | number }>;
   summaryRule: string | null; userTags: string[]; author: string | null;
   importedFrom: string | null; originProject: string | null; contentHash: string | null;
   sourceFile: string | null;
@@ -883,9 +1016,18 @@ export function getSessionFull(db: DB, id: string): SessionFull | undefined {
 export interface ImportedSessionInput {
   source: string; sourceSessionId: string; projectId: string;
   title: string | null; createdAt: string; lastEventAt: string | null;
-  messageCount: number; topics: string[]; decisions: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative' }>;
+  messageCount: number; topics: string[]; decisions: Array<{ text: string; seq: number; at?: string; pinned?: boolean; kind?: 'decision' | 'negative'; msgId?: string | number }>;
   summaryRule: string | null; author: string | null; importedFrom: string | null; originProject: string | null;
   contentHash: string | null; sourceFile: string | null;
+  /**
+   * 隔离导入时置 true → 会话落成 state='quarantine'（[1021 审查 #12]）。
+   *
+   * 病历：隔离导入以前与普通导入**存得一模一样**（origin='imported', state='confirmed'），
+   * 只有 source_file 指向隔离目录。后果：正文确实没入库，但包里的 decisions / summary
+   * 仍以"已确认会话"的身份被 listDecisions 正常返回 —— 隔离只隔离了正文，没隔离不可信结论。
+   * 现在给隔离会话一个**显式状态**，决策/未决视图据此排除；release_quarantine 放行时再改回 confirmed。
+   */
+  quarantined?: boolean;
 }
 
 /** 导入（T21 归化 + 往返规则）：同身份同 hash 跳过；同身份不同 hash → 后缀保留双方 */
@@ -911,8 +1053,8 @@ export function insertImportedSession(db: DB, s: ImportedSessionInput): { id: st
     INSERT INTO sessions (id, source, source_session_id, project_id, origin, state, title, created_at, last_event_at,
                           message_count, topics, decisions, summary_rule, meta_text, author, imported_from,
                           origin_project, content_hash, source_file, confirmed_at, extracted_version)
-    VALUES (?, ?, ?, ?, 'imported', 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, s.source, sid, s.projectId, s.title, s.createdAt, s.lastEventAt ?? s.createdAt,
+    VALUES (?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, s.source, sid, s.projectId, s.quarantined ? 'quarantine' : 'confirmed', s.title, s.createdAt, s.lastEventAt ?? s.createdAt,
     s.messageCount, JSON.stringify(s.topics), JSON.stringify(s.decisions), s.summaryRule, metaText,
     s.author, s.importedFrom, s.originProject, s.contentHash, s.sourceFile, new Date().toISOString(), EXTRACT_VERSION);
   return { id, skipped: false };
@@ -1060,6 +1202,22 @@ export function getLinkedSessions(db: DB, sessionId: string): LinkedSessionBrief
 
 // ── AI 笔记会话（MCP 写域：结论性记忆，source='note'，可溯源可检索） ──
 
+/**
+ * 这条会话是不是**手写笔记**（[1021 审查 #01] 判据收敛）。
+ *
+ * 病历：笔记建时写的是 source='note' / origin='manual'。但
+ *   · capture/archive.ts 查的是 `origin === 'note'` → 永不成立 → 笔记照样被归档，正文被删；
+ *   · capture/rebuild.ts 只迁 `origin = 'imported'` → 笔记不在其列 → 重建后笔记从新库消失。
+ * 两处各自写了一套"什么是笔记"的猜测，而且都猜错了。
+ * 现在只留这一个判据，所有需要"笔记要特殊保护"的地方都必须调它。
+ *
+ * 为什么用 source 而不是 origin：source 是**谁产的**（note = MCP save_note 写的），
+ * origin 是**怎么进来的**（manual = 不是自动采集）。后者会把任何人工补录也误判成笔记。
+ */
+// 判据本体在 shared/session-kind.ts（中性层，core/compact 也要用，不能从 store 反向依赖）。
+// 这里转出口，保持既有的 import { isNoteSession } from '../store/db.js' 调用点不变。
+export { isNoteSession, isUnrebuildableSession } from '../shared/session-kind.js';
+
 export function createNoteSession(db: DB, o: { projectId: string; title: string; content: string; tags?: string[] }): string {
   const now = new Date();
   const nid = `note-${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1144,6 +1302,35 @@ export function insertMessage(
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(m.sessionId, m.role, m.content, searchTextOf(idxSource), m.seqNum, m.createdAt ?? null);
   return info.changes;
+}
+
+/**
+ * 写入或**更新**一条消息（[1021 审查 #04]）。
+ *
+ * 病历：insertMessage 用的是 `INSERT OR IGNORE`，而 messages 上有 UNIQUE(session_id, seq_num)。
+ * 于是同一条消息**再次写入时被静默忽略** —— 这对流式回答是致命的：
+ * 让 ZCode 那种"同一条 part 的正文原地从半截变完整"的场景，永远只能存下第一次看到的半截，
+ * 结尾的修正/结论/失败说明全部丢失，而且**没有任何迹象**。
+ *
+ * 判据：内容或角色变了才 UPDATE，没变就一个字节都不动（避免无谓写放大与 FTS 重建）。
+ * 调用方负责决定"要不要重读"；这里只保证"重读了就能覆盖"。
+ */
+export function upsertMessage(
+  db: DB,
+  m: { sessionId: string; role: string; content: string; seqNum: number; createdAt?: string },
+): { changes: number; updated: boolean } {
+  const idxSource = m.content.length > 100_000 ? m.content.slice(0, 100_000) : m.content;
+  const prev = db.prepare(
+    'SELECT id, role, content FROM messages WHERE session_id = ? AND seq_num = ?',
+  ).get(m.sessionId, m.seqNum) as { id: number; role: string; content: string } | undefined;
+  if (!prev) {
+    const ins = insertMessage(db, m);
+    return { changes: ins, updated: false };
+  }
+  if (prev.role === m.role && prev.content === m.content) return { changes: 0, updated: false };
+  db.prepare('UPDATE messages SET role = ?, content = ?, search_text = ? WHERE id = ?')
+    .run(m.role, m.content, searchTextOf(idxSource), prev.id);
+  return { changes: 1, updated: true };
 }
 
 export function countMessages(db: DB, sessionId: string): number {

@@ -55,6 +55,20 @@ export const BRIEF_CANONICAL_FILTERS = [
   /^[\s\p{P}\d]{0,6}$/u,
   // 7. 先闭后开的撕裂直引号（`决定用 X"，但…往往是"试过 X` 的引号极性特征）
   /^[^"]*"[，,。；;]/,
+  // 8. 待决问句冒充决策（1018 实测：864 条里命中 20 条 = 2.31%，逐条看过全是真问句）
+  //    形状：`决定要不要 X` / `决定能不能 X` / `决定是否 X` —— 它们是在提出选择，不是拍板。
+  //    排除含箭头的：那是**在描述程序逻辑**（如「决定是否调用工具 → 条件边」），
+  //    实测那 2 条是唯一假阳性，加箭头排除后归零。
+  /^\s*决定\s*(?:要不要|能不能|是否|该不该|如何|怎么)(?![\s\S]*[→⇒])/,
+  // 9. 语音口述填充词（1020 实测 864 条命中 12 条）——用户口述里「呃/那个那个/就是说」
+  //    这类填充出来的长句，抽出来是一句话但语义上是碎片的碎。
+  /(呃|那个那个|就是说|然后就是|而不是是在|直接直接)/,
+  // 10. 报告残渣标记（命中 17 条）——`[in_progress]`/`[completed]` 这种是我自己写的进度报告
+  //    被抽进来了，不是用户的决策。只认方括号标记，不认单个箭头（箭头也可能是真决策的记号）。
+  /\[(in_progress|pending|completed|done)\]/i,
+  // 11. `决定了` + 疑问从句（命中 7 条）——`决定了我能不能…` / `决定了你所有…能不能走`
+  //    是**在问**，不是拍板。与第 8 条（`决定要不要X`）同族但形状不同，单列。
+  /^决定了[^，。]{0,3}(你|谁|能不能|要不要|为什么)/,
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,10 +102,58 @@ export const UNRESOLVED_FILTERS = [
   /^(?:并|而|且)\s*/,
 ]
 
-/** 未决问题是否够格进简报。false = 该拦。 */
+// ── 残片守卫（2026-10-17 夜 U-A 调研后加，见 docs/research/2026-10-18-U-A未决段处置调研.md §2.2/§3）──
+//
+// 病历：agent1super 实际注入的 3 条未决里 2 条是残片，precision ≈ 1/3。其中一条是 5 字的
+// 「怎么样呢？」—— 它躲过了全部四条规则，因为**共享下限 BRIEF_TEXT_MIN 是 5**（那条下限是为
+// decisions 设的：「改用 X」这类短决策是合法的，抬它会连带误伤）。
+//
+// 判据选的是「**剥掉疑问词与语气词之后还剩几个实义字**」，而不是简单抬长度——理由是
+// 长度分不开这两类：「怎么样呢？」5 字是残片，而「后续还能增加什么？」9 字是真问题。
+// 实测标定（两侧真问题清单见 tools/check-brief-filters.mjs §⑤）：
+//   残片 怎么样呢？→0 · 还有呢？→2 · 然后呢？→2      → 拦
+//   真问题 后续还能增加什么？→6 · 所以现在到底该用哪个判据？→10 · 那一边的测试集怎么样了？→8 → 放行
+const UNRESOLVED_QUESTION_WORDS = /(怎么样|怎样|怎么|什么|为什么|为啥|如何|哪个|哪些|哪边|哪里|哪儿|是否|能否|能不能|要不要|该不该|多少|多久|什么时候|谁)/g
+const UNRESOLVED_PARTICLES = /[呢吧吗啊呀嘛哦噢]/g
+
+/** 剥掉疑问词/语气词/标点后剩下的实义字数（导出让守门与调研脚本用同一口径）。 */
+export function unresolvedContentChars(q) {
+  return String(q ?? '')
+    .replace(UNRESOLVED_QUESTION_WORDS, '')
+    .replace(UNRESOLVED_PARTICLES, '')
+    .replace(/[？?！!。.，,、；;：:\s"'“”‘’()（）\-—_/\\]/g, '')
+    .length
+}
+/** 少于这个实义字数 = 残片（实测标定：残片 ≤2，最短的真问题 6）。 */
+export const UNRESOLVED_CONTENT_MIN = 4
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [1017 夜 · 12d 归核] 与 DSH 插件侧同一次改动：未决段判据的权威源搬到内核 dist/recall.js。
+// 下面那份实现降级为「内核缺席时的兼容兜底」，内核在场时一律以它为准。
+// ZCode 侧的引擎解析点只有一个（engine.mjs 的 loadEngine），这里复用它，不另立候选表。
+import { loadEngine } from './engine.mjs'
+const __engine = await loadEngine()
+const _recall = __engine?.mod ?? null
+// ⚠️ [复审 S3] 同 DSH 侧：引擎拿不到时**降级必须可见**（纪律 2「容错不许静默」）。
+//   原来这里一行输出都没有，用户只会看到简报变了却查不出原因。用 debug 开关，避免污染 hook stdout。
+if (!_recall && (process.env.SRELAY_DEBUG || process.env.SRELAY_BRIEF_DEBUG || process.env.SRELAY_HOOK_DEBUG)) {
+  console.error('[brief-filters] 内核 recall.js 取不到，未决段判据降级为本地兜底')
+}
+
+/** 未决段判据实际来自内核（true）还是本地兜底（false）。守门/selftest 断言它为 true。 */
+export const __unresolvedFromRecall = !!(
+  _recall && typeof _recall.passesUnresolvedFilters === 'function'
+)
+
+/** 未决段名额：转发内核权威值；引擎缺席时退回 1。 */
+export const UNR_SLOTS = __unresolvedFromRecall ? (_recall.UNR_SLOTS ?? 1) : 1
+
+/** 未决问题是否够格进简报。false = 该拦。**优先调内核权威判据**，缺席才用本地兜底。 */
 export function passesUnresolvedFilters(q) {
+  if (__unresolvedFromRecall) return _recall.passesUnresolvedFilters(q);
   const t = String(q ?? '').trim()
   if (t.length < BRIEF_TEXT_MIN) return false
+  if (unresolvedContentChars(t) < UNRESOLVED_CONTENT_MIN) return false
   for (const re of UNRESOLVED_FILTERS) {
     re.lastIndex = 0
     if (re.test(t)) return false
@@ -103,8 +165,27 @@ export function passesUnresolvedFilters(q) {
 export const BRIEF_TEXT_MIN = 5
 export const BRIEF_TEXT_MAX = 220
 
-/** 单条文本是否够格进简报。false = 该拦。 */
+// ─────────────────────────────────────────────────────────────────────────────
+// [1018 · 七条**收进内核**] 与上面未决段同一条路：判据权威源在内核，本文件的实现降级为兜底。
+//
+// 为什么要做这一步：此前七条只存在于两份客户端副本里，内核那份是「只参照」的抄本 ⇒
+//   守门只能证「两侧一致」，**证不了「两侧都对」** —— 两边一起改错时它照样绿。
+//   这不是外观补丁，是把权威源真的挪到内核：recall.js 是唯一说了算的那一份。
+//
+// 为什么保留本地兜底：插件是自包含发布件（用户可能只装 dsh-plugin 没配内核），
+//   删了就整段静默消失。**拿不到就降级 ≠ 判据有两份** —— recall 在场时永远是它说了算。
+//   和未决段一样，降级必须**可见**：__briefFromRecall 暴露实际走的是哪一份。
+
+/** 七条判据实际来自内核（true）还是本地兜底（false）。守门/selftest 断言它为 true。 */
+export const __briefFromRecall = !!(
+  _recall &&
+  typeof _recall.passesBriefFilters === 'function' &&
+  Array.isArray(_recall.BRIEF_CANONICAL_FILTERS)
+)
+
+/** 单条文本是否够格进简报。false = 该拦。**优先调内核权威判据**，缺席才用本地兜底。 */
 export function passesBriefFilters(text) {
+  if (__briefFromRecall) return _recall.passesBriefFilters(text)
   const t = String(text ?? '').trim()
   if (t.length < BRIEF_TEXT_MIN || t.length > BRIEF_TEXT_MAX) return false
   for (const re of BRIEF_CANONICAL_FILTERS) {

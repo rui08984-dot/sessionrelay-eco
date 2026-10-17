@@ -24,9 +24,43 @@ export { globalDbFile } from './store/global.js';
 export { PROBE_SQL, PROBE_MAX_MESSAGES, countProbeSessions } from './store/db.js';
 // [B4] harness 记账 token 判据（topics 清洗用；工具与核心库共用同一份词表）
 export { isSystemToken, isLikelyFile, isTopicNoise } from './core/extract/extract.js';
+// 冲突消解（新话压旧话）：判据与执行都只在核心库这一份
+export { findSupersedeConflicts, subjectTokens, hasNegation } from './store/global.js';
+// 压缩 L1：确定性去重合并（判据唯一一份，工具与 CLI 都从这里取）
+export { compactItems, isNearDuplicate } from './core/compact/dedup.js';
+// 呈现层折叠：适配器/插件要折叠显示也必须调这一份（不许自己抄一套判据）
+export { foldNearDuplicates, lengthRatioGate } from './core/compact/fold.js';
+// 老化压缩计划（只做计划；执行复用 capture/archive.ts 的 runArchive）
+export { planAging } from './core/compact/aging.js';
+
+// [1017 夜 U-A] 未决段的**渲染侧**过滤判据：核心 CLI 用它，工作区仓的 DSH 插件 / ZCode hook
+// 目前用的是同判据副本（不同仓库无法共用模块）。两边由 tools/check-brief-filters.mjs §⑥ 做
+// **行为对拍**（同一批样本判决必须完全一致）。终态是那两处也 import 这里 —— 见交接的后续任务。
+export { passesUnresolvedFilters, unresolvedContentChars, UNRESOLVED_CONTENT_MIN, UNR_SLOTS } from './cli/brief-filter.js';
+// [1017 夜 09:3x] 七条规范过滤器作**独立第三方参照**导出。
+//   本库渲染路径**不调用**它们（核心 CLI 不用这套判据），
+//   导出的唯一目的是让守门能做三方对拍 —— 在此之前两份客户端副本「同改」无人能发现。
+//   是否接入本库渲染是架构决策，见 docs/1018-七条规范过滤器-无第三方-结构原因.md。
+export { passesBriefFilters, BRIEF_CANONICAL_FILTERS, BRIEF_TEXT_MAX } from './cli/brief-filter.js';
+
+// ── 生命周期内核 API（ADR-002：宿主 hooks/workers 与 CLI 读同一份实现）──
+export { runLifecycle, lifecycleStatus } from './core/lifecycle/runner.js';
+export { integrityOf, repairProject } from './core/lifecycle/repair.js';
+export { STAGES, lightStages, ensureLifecycleTables, loadLifecycle, saveLifecycle, dueStages, setHeartbeat, heartbeatAgeMs } from './core/lifecycle/stages.js';
+export { compactExactSessions } from './core/compact/exact.js';
+export { cleanDerivedColumns } from './core/extract/derived-cleanup.js';
 // [B4] 清 topics 时 meta_text 必须**按原规重算**（title+topics 的索引文本）；
 // 导出核心库这两个函数，工具才不会自己拼一份（拼错=把搜索面写坏）。
 export { metaTextOf, searchTextOf } from './store/db.js';
+
+// ── 采集：宿主事件钩子（DSH hooks）在**宿主进程内**做单项目增量采集 ──
+// [1021 审查 #17] 钩子（integrations/dsh/src/hooks.mjs）一直在等这两个导出，而本仓库只导出
+// runLifecycle ⇒ 事件驱动即时采集恒报「内核缺 loadConfig / runSync」，且那条日志只在
+// SRELAY_BRIEF_DEBUG=1 时才可见（=坏了没人知道；主路径 srelay watch 正常，所以表现是
+// "偶尔慢半拍"而不是"完全没采集"，更难发现）。
+// 契约在这里显式化：配置加载与增量采集都只有核心库这一份实现，钩子不自抄（铁律 1/2）。
+export { loadConfig } from './shared/config.js';
+export { runSync } from './capture/sync.js';
 
 import fs from 'node:fs';
 import os from 'node:os';

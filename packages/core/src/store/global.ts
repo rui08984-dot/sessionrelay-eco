@@ -14,32 +14,18 @@ import { searchTextOf } from './db.js';
 import { normalize, parseQuery } from '../core/tokenize/tokenizer.js';
 import { workspaceKey } from '../shared/workspace.js';
 
-export const GRADES = {
-  'verified-tool': 9.0,
-  'verified-user': 7.5,
-  'verified-file': 6.0,
-  inferred: 1.5,
-} as const;
-export type Grade = keyof typeof GRADES;
-export type Scope = 'project' | 'domain' | 'global';
-export type Status = 'draft' | 'verified' | 'retired';
+// [1017 夜] 闸门判据搬进**零依赖**的 store/lesson-gate.ts。
+// 理由：面板宿主半要读"哪条经验现在能进注入层"，而它跑在没有原生模块的进程里，
+// 一旦 import 本文件就会被 better-sqlite3 拖住。判据仍只有一份，这里**原样再导出**，
+// 所有老调用点（CLI / MCP / 插件 / hook）一字不改。
+import { GRADES, INJECT_THRESHOLD, DECAY_PER_DAY, isInjectable, liveImportance } from './lesson-gate.js';
+import type { Grade, Scope, Status, LessonRow } from './lesson-gate.js';
+export { GRADES, INJECT_THRESHOLD, DECAY_PER_DAY, isInjectable, liveImportance };
+export type { Grade, Scope, Status, LessonRow };
 
-/**
- * 能进注入层的最低分。
- *
- * ⚠️ 必须是 5.5 而不是 6.0：verified-file 的基础分正好是 6.0，阈值若也取 6.0，
- * 那么**任何一丁点年龄衰减都会把它压到线下**（哪怕只过了几毫秒）——实测被测试抓到过
- * （expected 1 to be 2）。留 0.5 的间隔 = 新经验白送约 60 天曝光期，之后要靠被用来续命。
- */
-export const INJECT_THRESHOLD = 5.5;
-/** 年龄衰减：每天扣多少分（照抄实测值） */
-export const DECAY_PER_DAY = 0.0083;
-
-/** 全局库路径：~/.sessionrelay/global.sqlite（与项目库物理分开） */
-export function globalDbFile(): string {
-  const home = process.env.SRELAY_GLOBAL_HOME || path.join(os.homedir(), '.sessionrelay');
-  return path.join(home, 'global.sqlite');
-}
+/** 全局库路径：~/.sessionrelay/global.sqlite（与项目库物理分开）。实体在 shared/paths.ts。 */
+import { globalDbFile } from '../shared/paths.js';
+export { globalDbFile };
 
 export function openGlobal(file?: string): Database.Database {
   const f = file ?? globalDbFile();
@@ -72,34 +58,6 @@ export function openGlobal(file?: string): Database.Database {
   return db;
 }
 
-export interface LessonRow {
-  id: number; scope: Scope; workspace_id: string | null; domain: string | null;
-  text: string; grade: Grade; importance: number; status: Status;
-  hits: number; uses: number; needs_review: number; created_at: string;
-}
-
-/**
- * 闸 1 的**唯一判据**：这一条现在能不能进注入层（状态 + 定级 + 阈值，三样一起看）。
- *
- * 为什么要单拎出来（复审 C-3）：`lesson list` 的 ●/○ 此前只看分数不看 status，
- * 于是一条 `rejected` 但分数 7.5 的条目会显示"● 可进注入层"——而它根本进不去
- * （被 A-3 修出来的新终态 rejected 又制造了一个"显示与实际不一致"，正是 A-8 想消灭的那类）。
- * 现在显示与实际共用这一个函数。
- */
-export function isInjectable(row: LessonRow, now = Date.now()): boolean {
-  const st = String(row.status);
-  if (st !== 'verified' && st !== 'confirmed') return false;
-  if (row.grade === 'inferred') return false;
-  return liveImportance(row, now) >= INJECT_THRESHOLD;
-}
-
-/** 年龄衰减后的实时重要度（定级分**不重算**，重算的是这个） */
-export function liveImportance(row: LessonRow, now = Date.now()): number {
-  const days = Math.max(0, (now - Date.parse(row.created_at)) / 86400000);
-  const bonus = Math.log1p(row.uses) * 1.5 + Math.min(1.0, row.hits * 0.1);
-  return row.importance - days * DECAY_PER_DAY + bonus;
-}
-
 export interface AddInput {
   text: string; grade?: Grade; scope?: Scope; workspaceId?: string; domain?: string;
   quote?: string; sourceRef?: string; route?: string; status?: Status;
@@ -118,6 +76,14 @@ export function addLesson(db: Database.Database, input: AddInput): { id: number;
   let reason = '';
   if (grade !== 'inferred' && !input.sourceRef) { effectiveGrade = 'inferred'; reason = '给了定级但没给来源，降为 inferred'; }
   // 状态：有证据的显式录入 = verified；自动产 / 无来源 = draft（设计 §11.2 的「不能随便入库」）
+  //
+  // ⚠️ [1021 审查 #11] **凡是自动/批量写入方，必须显式传 status**，不许吃这个默认值。
+  //   病历：lesson-harvest（采集）只传了 grade + sourceRef，没传 status ⇒ 命中"有证据=verified" ⇒
+  //   库里落成 verified，而命令输出还在说「写入草稿」——**输出与库不一致**，人工复核门槛被绕过。
+  //   补救：采集侧已显式 status:'draft' 并回读核对；这里保留默认值不动，是因为**手工录入**
+  //   （srelay lesson add --source X --grade verified-user）本来就该是 verified，
+  //   改默认会破坏那个正常路径。
+  //   判据：你是"人在录"还是"程序在攒"？程序一律显式传 status。
   let status: Status = input.status ?? (effectiveGrade !== 'inferred' && !!input.sourceRef ? 'verified' : 'draft');
   // [红队 A-9] 显式 `--status verified` 不能绕开"没有定级就是草稿"：注入闸有 `grade <> 'inferred'` 兜着，
   // 但库里留一条"verified 且 inferred"的矛盾记录会让人误判（列表里到底算 ● 还是 ○）。
@@ -190,7 +156,7 @@ export function ftsExpr(q: string): string {
   return toks.map((t) => '"' + t + '"').join(' OR ');
 }
 
-export function maintainLessons(db: Database.Database): { decayed: number; retired: number; resurrected: number } {
+export function maintainLessons(db: Database.Database): { decayed: number; retired: number; resurrected: number; superseded: number } {
   const rows = db.prepare('SELECT * FROM lessons').all() as LessonRow[];
   const upd = db.prepare('UPDATE lessons SET status = ?, updated_at = ? WHERE id = ?');
   const now = new Date().toISOString();
@@ -204,7 +170,24 @@ export function maintainLessons(db: Database.Database): { decayed: number; retir
       if (r.status !== 'retired') { upd.run('retired', now, r.id); retired++; }
     } else if (r.status === 'retired') { upd.run('verified', now, r.id); resurrected++; }
   }
-  return { decayed, retired, resurrected };
+  // [新] 冲突消解：新话压旧话 —— 此前只有"环境事实"抽取有 supersede，决策/经验层完全没有。
+  //
+  // ⚠️ **实测之后改的设计（诚实记录）**：第一版做的是"自动把旧的那条退休"，
+  // 拿真库一跑，判出的 4 对**全是误判** —— 共用的词是"必须/于是/会话/实测"这类泛词，
+  // 两条其实互补而不是矛盾。**自动作废在这里是不可信的**：错杀一条真经验，比漏判十条严重得多。
+  // 所以降级为**advisory**：只把旧的标成 needs_review（人工看一眼），绝不改它的 status ——
+  // 这本身就是"自我怀疑"原则的正确用法：机器不确定的时候，标记不确定，而不是替人下结论。
+  let conflicts = 0;
+  const alive = db.prepare("SELECT * FROM lessons WHERE status = 'verified'").all() as LessonRow[];
+  for (const pair of findSupersedeConflicts(alive)) {
+    const older = alive.find((x) => x.id === pair.olderId);
+    if (!older || Number(older.needs_review) === 1) continue;
+    const note = (String(older.source_ref || '') ? String(older.source_ref) + ' · ' : '') + pair.reason;
+    db.prepare('UPDATE lessons SET needs_review = 1, updated_at = ?, source_ref = ? WHERE id = ?')
+      .run(now, note.slice(0, 400), pair.olderId);
+    conflicts++;
+  }
+  return { decayed, retired, resurrected, superseded: conflicts };
 }
 
 /** Markdown 导出：经验库必须人可读、可 git、可手改（借鉴实测做法） */
@@ -355,6 +338,75 @@ export function pickForInjection(db: Database.Database, o: PickOptions = {}): Le
     out.push(r);
     used += len;
     if (out.length >= top) break;
+  }
+  return out;
+}// ─────────────────────── 冲突消解：新话压旧话（判据唯一一份）───────────────────────
+// 用户直接质疑过："记忆会过期、会冲突，这些你们到底做了没？"
+// 实测审计（2026-10-17）：出生证 ✅（source_ref/created_at/extracted_version）、
+// 保质期 ✅（liveImportance 按日衰减 + INJECT_THRESHOLD，过期自动不注入）、
+// 会忘 ✅（cleanup_at/archive/retire/reject）、自我怀疑 ⚠️半做（needs_review 覆盖面有限）、
+// **新话压旧话 ⚠️只存在于环境事实抽取**（extractEnvFacts 的 supersede）——决策与经验层完全没有。
+// 这正是"今天说了新要求，它却翻出半年前旧记忆继续执行"的根因，所以在这里补上。
+//
+// 判据**故意保守**：宁可漏判（交人工），也不乱杀一条真经验。四条全中才算冲突。
+const NEG_MARKERS = ['不要', '不能', '不用', '不许', '不再', '别用', '避免', '禁止', '弃用', '废弃', '取消',
+  '关闭', '禁用', '停止', '撤掉', '移除', '删掉', '不准', '不', '别', '勿', '没有'];
+
+/** 泛词表：它们出现在任何两段技术文字里都不代表"同一主题"（实测误判就是这么来的） */
+const GENERIC_TOKENS = new Set([
+  '必须', '于是', '因为', '所以', '但是', '而且', '可以', '需要', '使用', '问题', '情况', '时候', '东西',
+  '地方', '一个', '这个', '那个', '这些', '那些', '自己', '里面', '上面', '下面', '直接', '基本', '一下',
+  '会话', '实测', '根因', '测试', '结果', '原因', '方案', '做法', '写法', '处理', '出现', '导致', '就是',
+  '不是', '没有', '不会', '不能', '不要', '如果', '来说', '而是', '还是', '这样', '那样', '什么',
+]);
+
+/** 取"实词"：英文词 + CJK 二元组（不引分词器：判据自洽、可单测） */
+export function subjectTokens(text: string): Set<string> {
+  const s = String(text || '');
+  const out = new Set<string>();
+  for (const m of s.matchAll(/[A-Za-z][A-Za-z0-9_.\-]{1,}/g)) out.add(m[0].toLowerCase());
+  for (const seg of s.replace(/[^一-龥]+/g, ' ').split(' ')) {
+    for (let i = 0; i + 2 <= seg.length; i++) out.add(seg.slice(i, i + 2));
+  }
+  return out;
+}
+
+export function hasNegation(text: string): boolean {
+  const s = String(text || '');
+  return NEG_MARKERS.some((m) => s.includes(m));
+}
+
+export interface SupersedePair { olderId: number; newerId: number; shared: string[]; reason: string }
+
+/** 找出"同一主题、极性相反"的经验对（新的在前）。纯函数 ⇒ 可单测；判据错了要立刻红。 */
+export function findSupersedeConflicts(rows: LessonRow[]): SupersedePair[] {
+  const out: SupersedePair[] = [];
+  const seen = new Set<number>();
+  const cand = rows.filter((r) => String(r.status) === 'verified');
+  for (let i = 0; i < cand.length; i++) {
+    for (let j = i + 1; j < cand.length; j++) {
+      const a = cand[i], b = cand[j];
+      const ka = String(a.scope) + '|' + String(a.workspace_id || '');
+      const kb = String(b.scope) + '|' + String(b.workspace_id || '');
+      if (ka !== kb) continue;
+      const ta = subjectTokens(a.text), tb = subjectTokens(b.text);
+      const sharedAll = [...ta].filter((t) => tb.has(t));
+      // ⚠️ 关键收紧（实测教训）：泛词（"必须/于是/会话/实测/根因"）不该算共同主题 ——
+      // 第一版就是被它们骗出 4 对误判。要求**至少 3 个具体词**，且两条文本本身要够像。
+      const shared = sharedAll.filter((t) => !GENERIC_TOKENS.has(t));
+      if (shared.length < 3) continue;
+      // 相似度用**重叠系数**（除以较短那条的词数）而不是 Jaccard：
+      // 两条长度差一倍时 Jaccard 会被稀释到 0.15，把真冲突也筛掉了（实测）。
+      const shorter = Math.min(ta.size, tb.size) || 1;
+      if (sharedAll.length / shorter < 0.25) continue;
+      if (hasNegation(a.text) === hasNegation(b.text)) continue;
+      const ta2 = String(a.updated_at || a.created_at || ''), tb2 = String(b.updated_at || b.created_at || '');
+      const newer = ta2 >= tb2 ? a : b, older = ta2 >= tb2 ? b : a;
+      if (seen.has(older.id)) continue;
+      seen.add(older.id);
+      out.push({ olderId: older.id, newerId: newer.id, shared: shared.slice(0, 6),
+        reason: '被 #' + newer.id + ' 取代（同一主题上出现了相反的说法：' + shared.slice(0, 3).join('/') + '）' });
+    }
   }
   return out;
 }

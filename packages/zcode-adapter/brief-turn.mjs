@@ -40,27 +40,12 @@ const dbg = (...a) => { if (DEBUG) console.error('[srelay-turn]', ...a); };
 // ⚠️ 这里曾经用 `path.join` 却没 import path、又用了没 import 的 pathToFileURL ⇒ 整个 try 抛错、
 //    被 catch 吞掉、**静默退回旧排序**（红队 B 7.2 抓到）。所以：候选循环整体包 try，
 //    但每一次命中都记下来源，DEBUG 时打印；守门 L 段会断言"默认环境下能拿到引擎"。
-const _jn = (...p) => join(...p);
-const _dn = (p) => dirname(p);
-let recallMod = null;
-let recallFrom = '';
-try {
-  const cands = [];
-  if (process.env.SRELAY_RECALL) cands.push(process.env.SRELAY_RECALL);
-  if (process.env.SRELAY_CLI_PATH) cands.push(_jn(_dn(process.env.SRELAY_CLI_PATH), 'recall.js'));
-  if (process.env.SRELAY_CLI) cands.push(_jn(_dn(process.env.SRELAY_CLI), 'recall.js'));
-  if (process.env.SRELAY_HOME) cands.push(_jn(process.env.SRELAY_HOME, 'core/SessionRelay/dist/recall.js'));
-  const npmPrefix = process.env.APPDATA || _jn(os.homedir(), 'AppData', 'Roaming');
-  cands.push(_jn(npmPrefix, 'npm', 'node_modules', '@ewanjasper', 'sessionrelay', 'dist', 'recall.js'));
-  cands.push('/usr/lib/node_modules/@ewanjasper/sessionrelay/dist/recall.js');
-  cands.push('/usr/local/lib/node_modules/@ewanjasper/sessionrelay/dist/recall.js');
-  for (const c of cands) {
-    if (!c || !existsSync(c)) { dbg('候选不存在:', c); continue; }
-    recallMod = await import(pathToFileURL(c).href);
-    recallFrom = c;
-    break;
-  }
-} catch (e) { recallMod = null; dbg('引擎加载失败:', e && e.message); }
+// [1017] 引擎解析统一交给 engine.mjs（同一份候选表）——原先内联在这里，而 brief-shared.mjs
+// 也需要引擎 ⇒ 抄第二份候选表就是又一个两侧漂移源。DEBUG 语义与来源打印保持不变。
+import { loadEngine } from './engine.mjs';
+const __loaded = await loadEngine();
+const recallMod = __loaded ? __loaded.mod : null;
+const recallFrom = __loaded ? __loaded.from : '';
 if (!recallMod) dbg('没拿到核心引擎（recall.js）⇒ 本轮不注入任何相关内容');
 
 function readStdin() {

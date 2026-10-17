@@ -12,7 +12,7 @@ import { loadConfig, type RelayConfig } from '../shared/config.js';
 import { dbFile, findRelayRoot, relayDir } from '../shared/paths.js';
 import { touchRegistry, registryCandidates, type RegistryCandidate } from '../shared/registry.js';
 import { openExisting, listSessions, listDecisions, listUnresolved,
-         getMessageRange, findSessionByPrefix, getSession, countsByState, countsBySource,
+         getMessageById, resolveMessageRef, findSessionByPrefix, getSession, countsByState, countsBySource,
          insertScopeLog, addSessionLink, getLinkedSessions, createNoteSession,
          getSessionFull, metaTextOf, type DB } from '../store/db.js';
 import { searchSessions } from '../search-svc/engine.js';
@@ -172,45 +172,107 @@ export function buildServer(get: () => ServeCtx, select?: (p: string) => Promise
   }, guard(async (args: { query: string; kind?: 'sessions' | 'decisions' | 'unresolved' | 'files'; limit?: number; topic?: string; source?: string; decision_kind?: 'decision' | 'negative'; project?: string } & zPredShape) => {
     const cur = get();
     const kind = args.kind ?? 'sessions';
+    // [1021 红队 R13] 检索命中出处补稳定主键：msg 是 seq（位置索引），会话被归档/裁剪后
+    //   按它回跳会指到错的那条。这里用 seq 反查一次拿到 messages.id，一并发给调用方。
+    const prov = (sessionId: string, seq: number) => {
+      const ref = resolveMessageRef(cur.db, sessionId, { seq });
+      return { msg: ref.message?.seq_num ?? seq, msgId: ref.message?.id ?? null };
+    };
 
-    // ── kind=decisions：本项目全部已确认技术决策（带出处，可回跳）──
+    // ── [1021 红队 R13] scope 装配**提前到分派之前**：四个 kind 共用同一套过滤 ──
+    // 病历：decisions / unresolved 两个分支在装配之前就 return 了，于是 scope.json 的 B 档、
+    // auto A 档对它们完全不生效 —— 实测「scope 只允许会话 A」时，决策检索照样返回范围外的 B
+    // （**隐私边界失守**），且 limit / since / until 被静默忽略。交接技能文档明确教用户
+    // 「以前定过吗 → srelay_search(kind='decisions')」，这条路不能越界。
+    const callPred = predFrom(args);
+    // T28：每次调用重新装配（scope.json 热更新）
+    const asm = assembleScope({ root: cur.root, cfg: cur.cfg, callPred, includeAuto: true });
+    /** scope 收窄后的会话 id 集合；null = 没收窄（full 逃生口 或 无过滤条件） */
+    const scopeSessionIds = (): Set<string> | null => {
+      const w = asm.where;
+      if (!w) return null;
+      const rows = cur.db.prepare(
+        `SELECT s.id FROM sessions s WHERE s.project_id = ?${w.sql ? ` AND ${w.sql}` : ''}`,
+      ).all(cur.project, ...(w.params ?? [])) as Array<{ id: string }>;
+      return new Set(rows.map((r) => r.id));
+    };
+    /** 本 kind 用不上的参数：加进响应的 not_applied 里**明说**，不许静默吞掉 */
+    const notApplied: string[] = [];
+    if (args.decision_kind !== undefined && kind !== 'decisions') notApplied.push('decision_kind');
+
+    // ── kind=decisions：已确认技术决策（带出处，可回跳）──
     if (kind === 'decisions') {
-      const rows = listDecisions(cur.db, cur.project, { topic: args.topic, source: args.source, kind: args.decision_kind });
+      const all = listDecisions(cur.db, cur.project, { topic: args.topic, source: args.source, kind: args.decision_kind });
+      const ids = scopeSessionIds();
+      const inScope = ids ? all.filter((r) => ids.has(r.sessionId)) : all;
+      const limited = typeof args.limit === 'number' && args.limit > 0 ? inScope.slice(0, args.limit) : inScope;
+      const outOfScope = all.length - inScope.length;
+      // query 在这条分支**没有词法含义**（决策是结论清单，不是全文索引）。老实现直接无视它，
+      // 于是"传一个不存在的词"也照样返回全部——现在改为明说：not_applied + note。
+      if (args.query) notApplied.push('query');
       return toolOut({
-        count: rows.length,
-        decisions: rows.map((r) => ({
+        kind: 'decisions',
+        scoped: !!asm.where, escaped: asm.escaped,
+        count: limited.length,
+        ...(notApplied.length ? { not_applied: notApplied } : {}),
+        ...(args.query ? { note: 'kind=decisions 不按 query 过滤（返回本项目决策，受 scope/limit 约束）；按词筛请用 kind=sessions' } : {}),
+        ...(outOfScope > 0 ? { hint: `另有 ${outOfScope} 条决策在 scope 之外，可调用 set_scope({mode:'full'}) 放宽（隐私 ignore 不受影响）` } : {}),
+        decisions: limited.map((r) => ({
           at: r.at, text: r.text, kind: r.kind ?? 'decision', pinned: r.pinned === true,
-          provenance: { sessionId: r.sessionId, source: r.source, title: r.title, msg: r.seq },
+          // [R13] 优先 msgId（稳定主键）；msg 仍是 seq，供不认 msgId 的老消费方用
+          provenance: { sessionId: r.sessionId, source: r.source, title: r.title, msgId: r.msgId ?? null, msg: r.seq },
         })),
       });
     }
 
     // ── kind=unresolved：提出过但（启发式判定）未解决的问题 ──
     if (kind === 'unresolved') {
-      const rows = listUnresolved(cur.db, cur.project, args.limit ?? 20);
-      return toolOut({ count: rows.length, unresolved: rows.map((r) => ({ q: r.q, at: r.at, provenance: sessionBrief(cur.db, r.sessionId) })) });
+      // 先取全量（listUnresolved 内部已做跨会话去重），再按 scope 收窄，最后才限量——
+      // 顺序反了就会"先砍 20 条再过滤"，返回 1 条却其实还有更多在 scope 内。
+      const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : 20;
+      const all = listUnresolved(cur.db, cur.project, Number.MAX_SAFE_INTEGER);
+      const ids = scopeSessionIds();
+      const inScope = ids ? all.filter((r) => ids.has(r.sessionId)) : all;
+      const rows = inScope.slice(0, limit);
+      const outOfScope = all.length - inScope.length;
+      if (args.query) notApplied.push('query');
+      return toolOut({
+        kind: 'unresolved',
+        scoped: !!asm.where, escaped: asm.escaped,
+        count: rows.length,
+        ...(notApplied.length ? { not_applied: notApplied } : {}),
+        ...(args.query ? { note: 'kind=unresolved 不按 query 过滤；按词筛请用 kind=sessions' } : {}),
+        ...(outOfScope > 0 ? { hint: `另有 ${outOfScope} 条在 scope 之外，可调用 set_scope({mode:'full'}) 放宽` } : {}),
+        unresolved: rows.map((r) => ({ q: r.q, at: r.at, provenance: sessionBrief(cur.db, r.sessionId) })),
+      });
     }
 
-    // ─── 以下两个 kind 都走全文检索（scope 装配 + 语义补充） ──
-    const callPred = predFrom(args);
-    // T28：每次调用重新装配（scope.json 热更新）
-    const asm = assembleScope({ root: cur.root, cfg: cur.cfg, callPred, includeAuto: true });
+    // ─── 以下两个 kind 走全文检索（语义补充） ──
+    // [1017 夜] 语义档的开关/模型**必须每次调用重读配置**：serve 是常驻进程，把 config 读一次就缓存
+    // ⇒ 用户关掉语义档或换模型都不生效，出现"看起来在工作"的半开状态（调研件 §4 的头号风险）。
+    // 重读代价是一次小文件读+parse，MCP 工具调用不在 prompt 热路径上，可以接受。
+    let cfgNow = cur.cfg;
+    try { cfgNow = loadConfig(cur.root); } catch { /* 配置坏了就沿用旧的，语义档本身也有状态记录 */ }
     // 语义补充命中（design-semantic：未启用返回 null = 纯 FTS，行为与 0.2.5 等价）
     const { semanticSearch } = await import('../search-svc/semantic.js');
-    const semHits = await semanticSearch(cur.db, cur.cfg, args.query, { project: cur.project, extraWhere: asm.where });
+    const semHits = await semanticSearch(cur.db, cfgNow, args.query, { project: cur.project, extraWhere: asm.where });
 
     // ── kind=files：某文件路径被哪些会话讨论过（跨 agent）──
     if (kind === 'files') {
-      const hits = searchSessions(cur.db, { project: cur.project, query: `"${args.query.replace(/\\/g, '/')}"`, limit: args.limit ?? 20, extraWhere: asm.where });
+      const hits = searchSessions(cur.db, { project: cur.project, query: `"${args.query.replace(/\\/g, '/')}"`, limit: args.limit ?? 20, extraWhere: asm.where, decay: cur.cfg.decay });
       return toolOut({
         kind: 'files', file: args.query,
         count: hits.length,
-        sessions: hits.map((h) => ({ ...sessionBrief(cur.db, h.sessionId), snippet: h.snippet, provenance: { ...sessionBrief(cur.db, h.sessionId), msg: h.seq } })),
+        sessions: hits.map((h) => ({ ...sessionBrief(cur.db, h.sessionId), snippet: h.snippet, provenance: { ...sessionBrief(cur.db, h.sessionId), ...prov(h.sessionId, h.seq) } })),
       });
     }
 
     // ── kind=sessions：搜会话（默认） ──
-    const hits = searchSessions(cur.db, { project: cur.project, query: args.query, limit: args.limit ?? 10, extraWhere: asm.where, semanticHits: semHits, semanticReserve: cur.cfg.semantic?.reserve_slots });
+    // [1021 红队 T9] kind=sessions 分支原来**没传 decay** —— 而 files 分支传了。
+//   同一行 searchSessions、只差一个参数，结果就是「按文件搜」受时间衰减、「按会话搜」不受。
+//   这不是写错，是**漏写**，而且没有任何断言会发现 —— 判据散在两处的典型。
+//   顺带按同文件 205-209 的规矩用 `cfgNow`（每次重读）而不是缓存的 `cur.cfg`。
+const hits = searchSessions(cur.db, { project: cur.project, query: args.query, limit: args.limit ?? 10, extraWhere: asm.where, semanticHits: semHits, semanticReserve: cfgNow.semantic?.reserve_slots, decay: cfgNow.decay });
     const out = hits.map((h) => ({
       ...sessionBrief(cur.db, h.sessionId),
       score: Number(h.score.toFixed(3)),
@@ -218,7 +280,7 @@ export function buildServer(get: () => ServeCtx, select?: (p: string) => Promise
       viaMeta: h.viaMeta,
       viaSemantic: h.viaSemantic ?? false,
       snippet: h.snippet,
-      provenance: { ...sessionBrief(cur.db, h.sessionId), msg: h.seq, note: `srelay_show 可取全文` },
+      provenance: { ...sessionBrief(cur.db, h.sessionId), ...prov(h.sessionId, h.seq), note: `srelay_show 可取全文` },
     }));
     // token 感知：告诉 AI 本次响应量 + 省 token 的深入路径
     const respBytes = Buffer.byteLength(JSON.stringify(out), 'utf8');
@@ -239,46 +301,125 @@ export function buildServer(get: () => ServeCtx, select?: (p: string) => Promise
       session_id: z.string(),
       start_msg: z.number().optional().describe('起始消息序号（含）'),
       end_msg: z.number().optional().describe('结束消息序号（含）'),
+      message_id: z.union([z.string(), z.number()]).optional().describe('消息稳定主键（出处块里的 msgId）。回跳单条出处时**优先用它**：seq 是位置索引，会话归档/裁剪后会漂'),
       role: z.enum(['user', 'assistant']).optional().describe('只取该角色的消息（user=用户提问，轻量）'),
       include_exchanges: z.boolean().optional().describe('附带关键往返（用户提问+AI结论对，约 3KB）——理解"为什么"的中间粒度，省去拉全文'),
       max_chars: z.number().optional().describe('单条截断长度（默认 1000；需全文时显式传大值如 5000）'),
       ...zProject,
     },
-  }, guard(async (args: { session_id: string; start_msg?: number; end_msg?: number; role?: 'user' | 'assistant'; include_exchanges?: boolean; max_chars?: number }) => {
+  }, guard(async (args: { session_id: string; start_msg?: number; end_msg?: number; message_id?: string | number; role?: 'user' | 'assistant'; include_exchanges?: boolean; max_chars?: number }) => {
     const { db, project } = get();
     const s = findSessionByPrefix(db, args.session_id, project) ?? getSession(db, args.session_id);
     if (!s) return toolOut({ found: false, reason: '未找到会话' });
     const DEFAULT_MSGS = 20;    // 上下文安全护栏（D22）
     const DEFAULT_CHARS = 1000;
     const HARD_TOTAL = 50 * 1024; // 50KB 硬顶
+    const cap = Math.max(1, Math.floor(Number(args.max_chars ?? DEFAULT_CHARS)));
 
-    const from = args.start_msg ?? 1;
-    const requestedTo = args.end_msg ?? Math.max(s.message_count, 1);
-    const to = Math.min(requestedTo, from + DEFAULT_MSGS - 1); // 不指定 end_msg 时最多 20 条
-    const cap = args.max_chars ?? DEFAULT_CHARS;
-
-    let msgs = getMessageRange(db, s.id, from, to);
-    if (args.role) msgs = msgs.filter((m) => m.role === args.role);
-
-    // 逐条累积，超 50KB 硬顶即停
-    const result: Array<{ seq: number; role: string; content: string; createdAt: string | null }> = [];
-    let totalBytes = 0;
-    let sizeTruncated = false;
-    for (const m of msgs) {
-      const content = m.content.length > cap
-        ? m.content.slice(0, cap) + `…(全文 ${m.content.length} 字，max_chars 可调大)`
-        : m.content;
-      const bytes = Buffer.byteLength(content, 'utf8');
-      if (totalBytes + bytes > HARD_TOTAL) { sizeTruncated = true; break; }
-      totalBytes += bytes;
-      result.push({ seq: m.seq_num, role: m.role, content, createdAt: m.created_at });
+    // [1021 红队 R14] **条数 ≠ 序号**。旧代码 requestedTo = s.message_count 把"条数"当 seq 上界、
+    //   默认 from=1；seq 有空洞时（两条消息 seq=100/500、message_count=2）查 seq 1..2
+    //   → **返回 0 条且不报错**。现在一律按 messages 里**真实存在的 seq** 分页。
+    const bounds = db.prepare('SELECT COUNT(*) AS n, MIN(seq_num) AS lo, MAX(seq_num) AS hi FROM messages WHERE session_id = ?')
+      .get(s.id) as { n: number; lo: number | null; hi: number | null } | undefined;
+    const totalMsgs = Number(bounds?.n ?? 0);
+    if (totalMsgs === 0) {
+      // 归档会话正文已删：明说，别回一个空数组让调用方猜（正文没了但决策骨架还在）
+      return toolOut({
+        found: false, sessionId: s.id, totalInDb: 0,
+        reason: '该会话在库里已无正文消息（归档/裁剪后只剩决策骨架）；要结论请用 srelay_search(kind:"decisions")',
+      });
     }
+    const startAt = Number.isFinite(Number(args.start_msg)) && Number(args.start_msg) > 0
+      ? Math.floor(Number(args.start_msg)) : Number(bounds?.lo ?? 1);
+    const endAt = Number.isFinite(Number(args.end_msg)) && Number(args.end_msg) > 0
+      ? Math.floor(Number(args.end_msg)) : null;
+    const roleFilter = args.role ?? null;
+
+    /** 一页消息：按现存 seq 升序取；end_msg / role 在 SQL 层过滤（先取后筛会让"条数"飘） */
+    const pageOf = (fromSeq: number, toSeq: number | null, limit: number) =>
+      db.prepare(
+        'SELECT id, seq_num, role, content, created_at FROM messages'
+        + ' WHERE session_id = ? AND seq_num >= ? AND (? IS NULL OR seq_num <= ?) AND (? IS NULL OR role = ?)'
+        + ' ORDER BY seq_num LIMIT ?',
+      ).all(s.id, fromSeq, toSeq, toSeq, roleFilter, roleFilter, limit) as Array<{ id: string | number; seq_num: number; role: string; content: string; created_at: string | null }>;
+
+    /** 按字节安全截断（不切碎多字节字符）——中文 1 字 = 3 字节，按字截断挡不住 50KB */
+    const clipBytes = (s0: string, maxBytes: number): string => {
+      let acc = ''; let used = 0;
+      for (const ch of s0) {
+        const w = Buffer.byteLength(ch, 'utf8');
+        if (used + w > maxBytes) break;
+        used += w; acc += ch;
+      }
+      return acc;
+    };
+
+    /** 内容裁剪 + **字节**硬顶的**唯一实现**（#14：msgId 分支此前完全没过这层，实测泄出 90,000 字节） */
+    const clipToBudget = (list: Array<{ id: string | number; seq_num: number; role: string; content: string; created_at: string | null }>) => {
+      const items: Array<{ seq: number; msgId: string | number; role: string; content: string; createdAt: string | null }> = [];
+      let bytes = 0; let truncated = false; let omitted = 0;
+      for (let i = 0; i < list.length; i++) {
+        const m = list[i];
+        const full = String(m.content ?? '');
+        // ① 先按 max_chars 截字；② 再按剩余字节硬顶截——**提示文案的字节也要预留**，
+        //    否则"截到 50KB 再加一句说明"会重新超顶（实测 51,265 > 51,200）。
+        let content = full.length > cap ? full.slice(0, cap) : full;
+        let cut = content.length !== full.length;
+        const room = HARD_TOTAL - bytes;
+        const note = `…(原文 ${full.length} 字，已按 max_chars=${cap}/50KB 硬顶截断)`;
+        const noteBytes = Buffer.byteLength(note, 'utf8');
+        if (Buffer.byteLength(content, 'utf8') + (cut ? noteBytes : 0) > room) {
+          if (items.length > 0) { omitted = list.length - i; truncated = true; break; }
+          // 第一条必须给出（否则整个响应是空的），但绝不超硬顶
+          content = clipBytes(content, Math.max(0, room - noteBytes));
+          cut = true;
+        }
+        if (cut) { content += note; truncated = true; }
+        bytes += Buffer.byteLength(content, 'utf8');
+        items.push({ seq: m.seq_num, msgId: m.id, role: m.role, content, createdAt: m.created_at });
+      }
+      return { items, bytes, truncated, omitted };
+    };
+
+    // [1021 红队 R14] 稳定主键回查（seq 会漂）：给了 message_id 就只回这一条。
+    //   查不到 = 原文已归档 —— 明说，不许回一个空数组让调用方猜。
+    //   ⚠️ 这条分支以前**完全没过 50KB 硬顶**，只按 max_chars 截单条内容，
+    //   实测一个 90,000 字节的长消息原样泄出（声明上限 51,200）。现在与主分支共用 clipToBudget。
+    if (args.message_id !== undefined && args.message_id !== null) {
+      const m = getMessageById(db, s.id, args.message_id);
+      if (!m) {
+        return toolOut({ found: false, sessionId: s.id, msgId: args.message_id, reason: '原文已归档：该 msgId 在库里已无对应消息（seq 也不可信，故不回落）' });
+      }
+      const one = clipToBudget([m]);
+      return toolOut({
+        found: true, via: 'msgId', session: sessionBrief(db, s.id),
+        range: [m.seq_num, m.seq_num], totalInDb: totalMsgs, returned: one.items.length,
+        totalBytesKB: Math.round(one.bytes / 1024),
+        estimated_tokens: Math.round(one.bytes / 3),
+        truncated: one.truncated,
+        messages: one.items,
+        provenance: { sessionId: s.id, source: s.source, createdAt: s.created_at, state: s.state },
+      });
+    }
+
+    const page = pageOf(startAt, endAt, DEFAULT_MSGS);
+    const got = clipToBudget(page);
+    const result = got.items;
+    // 实际返回的区间 vs 请求的区间分开给：旧实现把 [from, from+len-1] 当区间，
+    // 在 seq 有空洞时是一句谎话（说 1..2 其实给的是 100..500）。
+    const lastSeq = result.length ? result[result.length - 1].seq : startAt - 1;
+    const restWhere: string[] = ['session_id = ?', 'seq_num > ?'];
+    const restParams: unknown[] = [s.id, lastSeq];
+    if (endAt !== null) { restWhere.push('seq_num <= ?'); restParams.push(endAt); }
+    if (roleFilter) { restWhere.push('role = ?'); restParams.push(roleFilter); }
+    const restRow = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE ${restWhere.join(' AND ')}`).get(...restParams) as { n: number };
+    const rest = Number(restRow?.n ?? 0) + got.omitted;
 
     // 构建 hint（AI 行动指引——不信任 AI 自觉，用提示引导正确行为）
     const hints: string[] = [];
-    if (to < requestedTo || sizeTruncated) {
-      hints.push(`当前显示 ${result.length} 条（共 ${s.message_count} 条）`);
-      if (s.message_count > 20) hints.push('建议：role="user" 只看用户提问（通常很少）；srelay_search(kind:"decisions") 直接拿全部决策；start_msg 翻页');
+    if (rest > 0 || got.truncated) {
+      hints.push(`当前显示 ${result.length} 条（库里共 ${totalMsgs} 条${rest > 0 ? `，还有 ${rest} 条未返回` : ''}）`);
+      if (totalMsgs > DEFAULT_MSGS) hints.push('建议：role="user" 只看用户提问（通常很少）；srelay_search(kind:"decisions") 直接拿全部决策；start_msg 翻页');
     }
     // 关键往返（可选）：从 code_changes 列的 keyExchanges 字段取（归档后仍保留）
     let keyExchanges: unknown = undefined;
@@ -294,13 +435,14 @@ export function buildServer(get: () => ServeCtx, select?: (p: string) => Promise
       found: true,
       session: sessionBrief(db, s.id),
       summary_rule: s.summary_rule,
-      range: [from, from + result.length - 1],
-      roleFilter: args.role ?? 'all',
-      totalInDb: s.message_count,
+      range: result.length ? [result[0].seq, result[result.length - 1].seq] : null,
+      requestedRange: [startAt, endAt ?? null],
+      roleFilter: roleFilter ?? 'all',
+      totalInDb: totalMsgs,
       returned: result.length,
-      totalBytesKB: Math.round(totalBytes / 1024),
-      estimated_tokens: Math.round(totalBytes / 3),
-      truncated: to < requestedTo || sizeTruncated,
+      totalBytesKB: Math.round(got.bytes / 1024),
+      estimated_tokens: Math.round(got.bytes / 3),
+      truncated: rest > 0 || got.truncated,
       ...(keyExchanges !== undefined ? { key_exchanges: keyExchanges } : {}),
       ...(hints.length > 0 ? { hint: hints.join('；') } : {}),
       messages: result,

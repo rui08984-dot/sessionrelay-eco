@@ -12,8 +12,13 @@
 //      不碰原始消息、不走源文件、语义比 rebuild 轻得多（rebuild = 全量重扫源）
 //
 // 边界（诚实登记）：
-//   - 只重算「当前仍在库里的消息」。归档过的会话正文已删（保护规则允许它留骨架），
-//     重算只能基于残余消息 → 归档会话的脏数据不会被这机制清掉，那需要 rebuild。
+//   - 只重算「当前仍在库里的消息」。归档过的会话正文已删（保护规则允许它留骨架）。
+//     **【1021 更正】原文写「归档会话的脏数据不会被这机制清掉，那需要 rebuild」—— 这是错的。**
+//     归档会话走不了「重抽」路线，但它的 `decisions` 列还在，**纯文本判据就能重筛**。
+//     真正的原因不是「做不到」，而是**那段清理代码够不着**：批次 SELECT 带
+//     `cleanup_at IS NULL AND message_count > 0`，归档会话两条都不满足 ⇒ 永远选不中。
+//     修法见 `cleanArchivedDecisions()`（独立通道，纯文本重筛 + 事务 + 跑过打戳）。
+//     实测规模：831 条决策里 532 条卡在 497 个归档会话上，其中 107 条是 v24 会拒收的垃圾。
 //   - 限流 + 可中断：每批 N 个会话，单批耗时计入守护周期压力；失败不抛，下周期继续。
 import type { DB } from '../store/db.js';
 import { summaryRule, extractFiles, passesDecisionTextGuards } from '../core/extract/extract.js';
@@ -180,8 +185,14 @@ function ensureTable(db: DB): void {
 
 /** 本库记录的重算版本（无记录 = 0，视为全新库/未初始化） */
 export function extractVersionOf(db: DB): number {
-  ensureTable(db);
-  const row = db.prepare('SELECT version FROM extract_meta WHERE id = 1').get() as { version: number } | undefined;
+  // [1020] 只读容错：`ensureTable` 做的是 CREATE TABLE（**写操作**），而本函数也会被
+  //   **只读连接**调用 —— `srelay doctor` 用 `new Database(f, { readonly: true })` 调它做体检。
+  //   原本直接 ensureTable ⇒ 只读库上抛 `attempt to write a readonly database`，
+  //   doctor 只能把它显示成一条 ⚠️ —— **新用户第一次跑 doctor 就会撞到**（本轮实测）。
+  //   正确语义：表在就跳过；不在（全新库）说明还没提取过，返回 0 本来就是真实答案。
+  try { ensureTable(db); } catch { /* 只读连接且表不存在 */ }
+  let row: { version: number } | undefined;
+  try { row = db.prepare('SELECT version FROM extract_meta WHERE id = 1').get() as { version: number } | undefined; } catch { row = undefined; /* 表根本不存在（全新库/只读）⇒ 版本即 0，这是真实答案不是错误 */ }
   return row?.version ?? 0;
 }
 
@@ -193,14 +204,24 @@ export interface RecomputeResult {
   /** [v14] 本批提取抛异常、被跳过并打了版本戳的会话数。
    *  旧实现是"游标越过即放弃"，但**不留任何痕迹**；现在至少能被看见（>0 会告警）。 */
   failed: number;
+  /** [1021] 本轮从**归档会话**里清掉的存量垃圾决策条数。
+   *  `-1` = 清理过程抛异常（调用方应告警）；`0` = 没有要清的。
+   *  为什么要这个字段：归档会话的正文已删，走不了「重抽」那条路，
+   *  只能纯文本重筛 —— 而它此前**永远不可达**（被 SELECT 的 `cleanup_at IS NULL AND message_count > 0` 挡掉），
+   *  实测 532 条决策卡在 497 个归档会话上、其中 107 条是现行规则会拒收的垃圾。 */
+  archivedCleaned: number;
 }
 
-/** 取一个待重算会话的当前消息（用于重新跑提取器）。 */
+/** 取一个待重算会话的当前消息（用于重新跑提取器）。
+ *  ⚠️ [1021 红队 R13] SELECT 必须带 `id`：这是**版本重算**写路径，原来不带 id ⇒
+ *    extractDecisions 里的 `msgId: m.id` 恒为 undefined ⇒ v22 的"稳定主键"从来没写进库
+ *    （实测 622 场 / 831 条决策 msgId 覆盖率 **0%**）。读端修好也没东西可读，先补这里。 */
 function messagesOf(db: DB, sessionId: string): Msg[] {
   const rows = db.prepare(
-    'SELECT role, content, seq_num AS seqNum, created_at AS createdAt FROM messages WHERE session_id = ? ORDER BY seq_num',
-  ).all(sessionId) as Msg[];
-  return rows.map(r => ({ role: r.role, content: r.content, seqNum: r.seqNum, createdAt: r.createdAt ?? null }));
+    'SELECT id, role, content, seq_num AS seqNum, created_at AS createdAt FROM messages WHERE session_id = ? ORDER BY seq_num',
+  ).all(sessionId) as Array<{ id: number; role: 'user' | 'assistant'; content: string; seqNum: number; createdAt: string | null }>;
+  // id 归一成字符串：messages.id 是 INTEGER，两条写路径（重算 / confirm）形态保持一致
+  return rows.map((r) => ({ id: String(r.id), role: r.role, content: r.content, seqNum: r.seqNum, createdAt: r.createdAt ?? null }));
 }
 
 /** 重算单个会话的提取字段（写回同一行，不动消息本体）。 */
@@ -313,15 +334,87 @@ function remainingCount(db: DB): number {
  *
  *  失败不抛：单会话异常跳过并打版本戳（与旧实现"游标越过即放弃"同语义，避免每周期对
  *  同一个坏会话无限重试），但计数会出现在 RecomputeResult.failed 里，不再无痕。 */
+/**
+ * [1021 · 红队/extract-v2 双料发现修复] **归档会话的存量决策清理**。
+ *
+ * ── 原来为什么清不掉 ──
+ *   本文件 226 行附近**早就有**「归档会话按现行规则清理存量决策」的代码（v14/1015 夜加的），
+ *   但它挂在 `msgs.length === 0` 分支下，而进入那条分支的前提是被 SELECT 选中 ——
+ *   `remainingCount` 与批次 SELECT **都带** `cleanup_at IS NULL AND message_count > 0`。
+ *   归档会话恰好 `cleanup_at` 非空、`message_count` 被清成 0 ⇒ **永远选不中 ⇒ 那段清理永远不可达**。
+ *   实测：831 条决策只有 299 条能重算，**532 条挂在 497 个归档会话上动不了，其中 107 条是 v24 会拒收的垃圾**。
+ *
+ * ── 为什么必须单独一条通道 ──
+ *   归档会话的**正文已删**（这是归档的定义），所以它们**不可能**走「重抽一遍」那条路。
+ *   但它们的 `decisions` 列还在 —— 于是正确做法是**纯文本级重筛**：不依赖消息，只跑判据。
+ *   这正是 226 行那段代码原本的设计意图，本函数只是给它一条**真正能被执行到**的路径。
+ *
+ * ── 安全性 ──
+ *   · 只**删**判据不通过的，绝不新增或改写保留项；
+ *   · 全程一个事务，中途异常整批回滚；
+ *   · 只处理 `extracted_version < 当前版本` 的行，跑过一次就打戳，不会每轮重扫；
+ *   · 返回清理条数，调用方负责打日志（**不许静默**）。
+ */
+export function cleanArchivedDecisions(db: DB): number {
+  // ⚠️ [1021 红队 T6 补充] 原来 WHERE 里还有 `AND decisions IS NOT NULL AND decisions != '[]'` ——
+  //   于是**决策为空的归档会话永远选不中，也就永远打不上版本戳** ⇒ 每轮都被重扫一遍，
+  //   实测 502 场归档会话里 310 场卡在 <25 就是这个原因。
+  //   现在把所有版本落后的归档会话都选出来：有决策的重筛，没决策的**只打戳**（不做事、不重扫）。
+  const rows = db.prepare(
+    `SELECT id, decisions FROM sessions
+     WHERE extracted_version < ? AND (cleanup_at IS NOT NULL OR message_count = 0)`,
+  ).all(EXTRACT_VERSION) as Array<{ id: string; decisions: string | null }>;
+  if (rows.length === 0) return 0;
+  let removed = 0;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const r of rows) {
+      // 决策为空/NULL：没什么可清的，**只打戳**就走（否则会每轮被重扫）。
+      if (r.decisions === null || r.decisions === undefined || r.decisions === '' || r.decisions === '[]') { markAttempted(db, r.id); continue; }
+      // 需要 pinned 字段（见下方 T8 豁免），所以类型要带它，否则读不到。
+      let arr: Array<{ text?: string; pinned?: boolean }> = [];
+      try { arr = JSON.parse(r.decisions); } catch { markAttempted(db, r.id); continue; }  // 坏 JSON 不阻塞，但要打戳防重试每轮重试
+      if (!Array.isArray(arr)) { markAttempted(db, r.id); continue; }
+      // ── [1021 红队 T8 修复] **pinned 决策豁免** ──
+      //   红队合成复现：一条 pinned 的垃圾决策同样被删掉（removed=1）。
+      //   而 pinned 是**用户亲手置顶**的东西 —— 判断「它不是决策」的权力不该高于用户的手动选择。
+      //   本库当前 0 条 pinned（无现存受害），但这属于「一旦发生就找不回来」的删数据路径，必须提前堵上。
+      //   简报过滤器那边早就有 pin 豁免，这里漏了 —— 判据只许有一份，现在补齐。
+      const kept = arr.filter((d) => d?.pinned === true || passesDecisionTextGuards(String(d?.text ?? '')));
+      if (kept.length !== arr.length) {
+        removed += arr.length - kept.length;
+        db.prepare('UPDATE sessions SET decisions = ? WHERE id = ?').run(JSON.stringify(kept), r.id);
+      }
+      markAttempted(db, r.id);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* 回滚失败也不掩盖原始错误 */ }
+    throw e;
+  }
+  return removed;
+}
+
 export function recomputeExtractions(db: DB, batch = BATCH_SIZE): RecomputeResult {
   ensureTable(db);
   const cur = extractVersionOf(db);
+  // [1021] 归档会话的存量决策清理必须在**早退之前**跑 —— 否则版本一旦追平就永远轮不到它。
+  //   这也是 226 行那段清理一直够不着归档会话的根本原因（它排在早退之后）。
+  //   失败不阻塞主流程（归档清理是增量修复，不是主链路），但要把数字**带出去**让人看得见，不许静默。
+  // [1021 红队 T6 修复] 原来这里还套了一层**库级**闸门 `if (cur < EXTRACT_VERSION)`。
+  //   问题：库级版本一追平（extract_meta.version == 当前版本）就再也不跑清理，
+  //   而归档会话的**逐行**版本可能仍然落后 —— 实测库版本 25 时仍有 310 场归档会话 < 25。
+  //   现在无条件跑：`cleanArchivedDecisions` 自己按逐行版本筛、跑过打戳，天然幂等，
+  //   所以每轮多付的代价只是「一条走索引的空查询」。
+  let archivedCleaned = 0;
+  try { archivedCleaned = cleanArchivedDecisions(db); }
+  catch { archivedCleaned = -1; }   // -1 = 清理失败（调用方据此告警）；0 = 没有要清的
 
   const total = remainingCount(db);
   if (total === 0) {
     // 全部跟上：把库级版本推进到当前规则版本（doctor 的「提取规则版本」读它）
     if (cur < EXTRACT_VERSION) finishVersion(db, 0);
-    return { recomputed: 0, remaining: 0, failed: 0 };
+    return { recomputed: 0, remaining: 0, failed: 0, archivedCleaned };
   }
 
   const todo = db.prepare(
@@ -336,7 +429,7 @@ export function recomputeExtractions(db: DB, batch = BATCH_SIZE): RecomputeResul
     // 有 remaining 却选不出行 = 目标集口径不一致（例如列被外部写成 NULL）。
     // 不静默：把库版本推进避免守护空转，remaining 原样返回让人看得见。
     finishVersion(db, 0);
-    return { recomputed: 0, remaining: total, failed: 0 };
+    return { recomputed: 0, remaining: total, failed: 0, archivedCleaned };
   }
 
   let done = 0;
@@ -349,7 +442,7 @@ export function recomputeExtractions(db: DB, batch = BATCH_SIZE): RecomputeResul
   const left = remainingCount(db);
   if (left === 0) {
     finishVersion(db, done);
-    return { recomputed: done, remaining: 0, failed };
+    return { recomputed: done, remaining: 0, failed, archivedCleaned };
   }
 
   const prev = (db.prepare('SELECT progress FROM extract_meta WHERE id = 1').get() as { progress?: number } | undefined)?.progress ?? 0;
@@ -363,7 +456,7 @@ export function recomputeExtractions(db: DB, batch = BATCH_SIZE): RecomputeResul
        cursor_id = \'\',
        progress_version = excluded.progress_version`,
   ).run(cur, new Date().toISOString(), done, left, prev + done, EXTRACT_VERSION);
-  return { recomputed: done, remaining: left, failed };
+  return { recomputed: done, remaining: left, failed, archivedCleaned };
 }
 
 function finishVersion(db: DB, done: number): void {

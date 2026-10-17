@@ -35,7 +35,9 @@ const ZCODE = path.resolve(arg('zcode-home', path.join(os.homedir(), '.zcode')))
 const NODE = arg('node', process.execPath);
 const TARGET = path.join(ZCODE, 'hooks', 'statebrief');
 const CONFIG = path.join(ZCODE, 'cli', 'config.json');
-const FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs'];
+// engine.mjs 必须在清单里：它是引擎解析的唯一入口，漏拷的后果是 hook 直接 ERR_MODULE_NOT_FOUND
+// 崩溃（1017 实测：装完"✅ 安装完成"、但每次会话 hook 都静默失败）——安装器的清单就是部署契约。
+const FILES = ['brief.mjs', 'brief-shared.mjs', 'brief-filters.mjs', 'brief-turn.mjs', 'engine.mjs'];
 
 let bad = 0;
 const say = (s) => console.log(s);
