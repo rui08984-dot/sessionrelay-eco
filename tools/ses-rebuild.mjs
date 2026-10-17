@@ -55,7 +55,7 @@ step(3, "镜像插件源码到其余副本（含 .pnpm 硬链接那份）");
 // 所以这一步属于构建管线（而不是又一个巡检脚本）。启动命令只在这里写一份。
 function restartWatchDaemon() {
   try {
-    const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*srelay.js*watch*' } | ForEach-Object { $_.ProcessId.ToString() }";
+    const ps = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*srelay.js*watch*' -and $_.CommandLine -like '*--global*' } | ForEach-Object { $_.ProcessId.ToString() }";
     const out = execFileSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
     const pids = out.trim().split(/\r?\n/).filter(Boolean).map((x) => Number(x.trim())).filter(Number.isFinite);
     // ⚠️ 2026-10-17 实测两处"采集停摆"：① 没有旧进程时这里直接 return（守护就一直没起来）；
@@ -105,7 +105,7 @@ function watchGlobalPids() {
     if (up && age < 60_000) locked.push(Number(j.pid))
   } catch { /* 没锁就靠进程表 */ }
   if (locked.length) return locked
-  const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*srelay.js*watch*' } | ForEach-Object { $_.ProcessId.ToString() }"
+  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*srelay.js*watch*' -and $_.CommandLine -like '*--global*' } | ForEach-Object { $_.ProcessId.ToString() }"
   try {
     const out = execFileSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 30000 })
     return out.trim().split(/\r?\n/).filter(Boolean).map((x) => Number(x.trim())).filter(Number.isFinite)
